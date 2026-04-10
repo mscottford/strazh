@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS sdk
+FROM mcr.microsoft.com/dotnet/sdk:10.0-alpine AS sdk
 RUN mkdir -p /src/Stahz
 WORKDIR /src
 COPY Strazh/Strazh.csproj Strazh/Strazh.csproj
