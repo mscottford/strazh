@@ -148,31 +148,35 @@ namespace Strazh.Analysis
             return new AnalysisContext(workspace, projects);
         }
 
-        // Launches all MSBuild design-time builds in parallel (Build stage), then as each
-        // completes feeds it sequentially into the Roslyn AdhocWorkspace (Load stage), and
-        // yields the (Project, IAnalyzerResult) pair immediately — without waiting for all
-        // projects to finish first.
+        // Runs all MSBuild design-time builds in parallel (Build stage), waits for all to
+        // complete, then feeds results sequentially into the Roslyn AdhocWorkspace (Load stage),
+        // yielding each (Project, IAnalyzerResult) pair immediately so the Analyze and Insert
+        // stages can begin on each project without waiting for all projects to finish loading.
         //
-        // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential while
-        // the underlying builds run concurrently on the thread pool.
+        // Build and Load cannot be interleaved: AddToWorkspace(addProjectReferences: true) calls
+        // analyzer.Build() internally for any referenced project not yet in the workspace. If
+        // other builds are still in-flight when this happens, two concurrent builds of the same
+        // project race and Buildalyzer's environment detection fails. Waiting for all builds to
+        // complete first avoids the race while still streaming Load → Analyze.
+        //
+        // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential.
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
             IAnalyzerManager manager, AdhocWorkspace workspace)
         {
-            // Build stage: launch all MSBuild design-time builds concurrently
-            List<Task<IAnalyzerResult?>> buildTasks = manager.Projects.Values
-                .Select(p => Task.Run<IAnalyzerResult?>(() =>
+            // Build stage: run all MSBuild design-time builds concurrently and wait for all
+            IAnalyzerResult?[] results = await Task.WhenAll(
+                manager.Projects.Values.Select(p => Task.Run<IAnalyzerResult?>(() =>
                 {
                     Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
                     var result = p.Build().FirstOrDefault();
                     Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
                     return result;
-                }))
-                .ToList();
+                })));
 
-            // Load stage: as each build completes, add it to the workspace immediately
-            await foreach (var completedTask in Task.WhenEach(buildTasks))
+            // Load stage: add each completed result to the workspace and yield immediately,
+            // so analysis can begin on each project without waiting for all to be loaded
+            foreach (var result in results)
             {
-                var result = await completedTask;
                 if (result is null) continue;
 
                 Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - starting");
