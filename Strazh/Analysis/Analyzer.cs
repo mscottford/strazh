@@ -163,14 +163,24 @@ namespace Strazh.Analysis
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
             IAnalyzerManager manager, AdhocWorkspace workspace)
         {
-            // Build stage: run all MSBuild design-time builds concurrently and wait for all
+            // Build stage: run MSBuild design-time builds in parallel, capped at the number
+            // of logical processors so we don't spawn an unbounded number of dotnet processes
+            var buildSemaphore = new SemaphoreSlim(Environment.ProcessorCount);
             IAnalyzerResult?[] results = await Task.WhenAll(
-                manager.Projects.Values.Select(p => Task.Run<IAnalyzerResult?>(() =>
+                manager.Projects.Values.Select(p => Task.Run<IAnalyzerResult?>(async () =>
                 {
-                    Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
-                    var result = p.Build().FirstOrDefault();
-                    Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
-                    return result;
+                    await buildSemaphore.WaitAsync();
+                    try
+                    {
+                        Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                        var result = p.Build().FirstOrDefault();
+                        Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                        return result;
+                    }
+                    finally
+                    {
+                        buildSemaphore.Release();
+                    }
                 })));
 
             // Load stage: add each completed result to the workspace and yield immediately,
