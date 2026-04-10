@@ -168,8 +168,10 @@ namespace Strazh.Analysis
 
             // Add each result to the new workspace (sorted in solution order above, if we have a solution).
             // AdhocWorkspace mutations are not thread-safe, so this loop remains sequential.
+            Console.WriteLine("Loading projects into workspace - starting");
             foreach (IAnalyzerResult result in results)
             {
+                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - starting");
                 var existingProject = workspace.CurrentSolution.Projects.FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
                 if (existingProject is null)
                 {
@@ -186,7 +188,9 @@ namespace Strazh.Analysis
                     // is analyzed — just reuse the workspace Project object already there.
                     projectResults.Add((existingProject, result));
                 }
+                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - finished");
             }
+            Console.WriteLine("Loading projects into workspace - finished");
 
             return new AnalysisContext(workspace, projectResults.ToList());
         }
