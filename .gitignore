@@ -5,3 +5,4 @@ bin
 obj
 .DS_Store
 app
+*.DotSettings.user
