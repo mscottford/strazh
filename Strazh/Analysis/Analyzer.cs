@@ -8,11 +8,9 @@ using Buildalyzer;
 using Buildalyzer.Workspaces;
 using System.Collections.Generic;
 using System;
-using System.Collections.Concurrent;
 using Strazh.Database;
 using static Strazh.Analysis.AnalyzerConfig;
 using System.IO;
-using Microsoft.Build.Construction;
 
 namespace Strazh.Analysis
 {
@@ -31,12 +29,6 @@ namespace Strazh.Analysis
                 : config.Projects.Select(x => manager.GetProject(x))).ToList();
 
             Console.WriteLine($"Analyzer ready to analyze {projectAnalyzers.Count} project/s.");
-            
-            Console.WriteLine("Building workspace...");
-            var context = GetAnalysisContext(manager);
-            Console.WriteLine("done.");
-            
-            Console.WriteLine("Analyzing workspace...");
 
             // Delete graph data upfront before parallel analysis begins, so that no project
             // races against the delete.
@@ -45,80 +37,91 @@ namespace Strazh.Analysis
                 await DbManager.DeleteData(config.Credentials);
             }
 
+            var workspace = CreateWorkspace(manager);
+
             // Limit concurrent Neo4j connections to avoid exhausting the connection pool.
             var semaphore = new SemaphoreSlim(4);
-            var total = context.Projects.Count;
+            var total = projectAnalyzers.Count;
+            var tasks = new List<Task>();
+            var index = 0;
 
-            // Analyze and insert all projects concurrently. Task.Run ensures CPU-bound work
-            // (syntax tree walking) runs on thread-pool threads rather than the calling thread.
-            var tasks = context.Projects.Select((entry, index) => Task.Run(async () =>
+            // Stream projects through the Build → Load pipeline and launch an Analyze + Insert
+            // task for each one as soon as it becomes available, without waiting for all
+            // projects to finish building and loading first.
+            await foreach (var entry in StreamProjectsAsync(manager, workspace))
             {
-                var triples = new List<Triple>();
+                var capturedEntry = entry;
+                var capturedIndex = index++;
 
-                if (config.IsSolutionBased)
+                tasks.Add(Task.Run(async () =>
                 {
-                    var solutionRoot = GetRoot(manager.SolutionFilePath);
-                    var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
+                    var triples = new List<Triple>();
 
-                    var solutionName = GetSolutionName(manager.SolutionFilePath);
-                    var solutionNode = new SolutionNode(solutionName);
-                    triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
-
-                    var projectNode = new ProjectNode(GetProjectName(entry.Item1.Name));
-                    triples.Add(new TripleContains(solutionNode, projectNode));
-                }
-
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: analyze - starting");
-                var projectTriples = await AnalyzeProject(index + 1, entry, config.Tier);
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: analyze - finished");
-
-                triples.AddRange(projectTriples);
-
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: grouping - starting");
-                try
-                {
-                    triples = triples.GroupBy(x => x.ToString()).Select(x => x.First()).OrderBy(x => x.NodeA.Label)
-                        .ToList();
-                }
-                catch (Exception)
-                {
-                    Console.WriteLine("Error detected. Dumping detailed logging data.");
-                    Console.WriteLine("[");
-                    var first = true;
-                    foreach (var triple in triples)
+                    if (config.IsSolutionBased)
                     {
-                        if (!first)
+                        var solutionRoot = GetRoot(manager.SolutionFilePath);
+                        var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
+
+                        var solutionName = GetSolutionName(manager.SolutionFilePath);
+                        var solutionNode = new SolutionNode(solutionName);
+                        triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
+
+                        var projectNode = new ProjectNode(GetProjectName(capturedEntry.Item1.Name));
+                        triples.Add(new TripleContains(solutionNode, projectNode));
+                    }
+
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: analyze - starting");
+                    var projectTriples = await AnalyzeProject(capturedIndex + 1, capturedEntry, config.Tier);
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: analyze - finished");
+
+                    triples.AddRange(projectTriples);
+
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: grouping - starting");
+                    try
+                    {
+                        triples = triples.GroupBy(x => x.ToString()).Select(x => x.First()).OrderBy(x => x.NodeA.Label)
+                            .ToList();
+                    }
+                    catch (Exception)
+                    {
+                        Console.WriteLine("Error detected. Dumping detailed logging data.");
+                        Console.WriteLine("[");
+                        var first = true;
+                        foreach (var triple in triples)
                         {
-                            Console.WriteLine(",");
+                            if (!first)
+                            {
+                                Console.WriteLine(",");
+                            }
+                            Console.Write($$"""{ "triple": {{ triple.ToInspection()}} }""");
+
+                            first = false;
                         }
-                        Console.Write($$"""{ "triple": {{ triple.ToInspection()}} }""");
-
-                        first = false;
+                        if (triples.Any())
+                        {
+                            Console.WriteLine("");
+                        }
+                        Console.WriteLine("]");
+                        throw;
                     }
-                    if (triples.Any())
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: grouping - finished");
+
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: insert - starting");
+                    await semaphore.WaitAsync();
+                    try
                     {
-                        Console.WriteLine("");
+                        await DbManager.InsertData(triples, config.Credentials);
                     }
-                    Console.WriteLine("]");
-                    throw;
-                }
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: grouping - finished");
-
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: inserting - starting");
-                await semaphore.WaitAsync();
-                try
-                {
-                    await DbManager.InsertData(triples, config.Credentials);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: inserting - finished");
-            })).ToList();
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: insert - finished");
+                }));
+            }
 
             await Task.WhenAll(tasks);
-            context.Workspace.Dispose();
+            workspace.Dispose();
         }
 
         public class AnalysisContext(AdhocWorkspace workspace, List<(Project, IAnalyzerResult)> projects)
@@ -128,71 +131,82 @@ namespace Strazh.Analysis
         }
         
         // Based on https://github.com/phmonte/Buildalyzer/blob/9db3390b49dca033fd3f70439bab3a6327440a47/src/Buildalyzer.Workspaces/AnalyzerManagerExtensions.cs#L24-L60
-        public static AnalysisContext GetAnalysisContext(IAnalyzerManager manager)
+        public static async Task<AnalysisContext> GetAnalysisContext(IAnalyzerManager manager)
         {
             if (manager is null)
             {
                 throw new ArgumentNullException(nameof(manager));
             }
-            
-            var projectResults = new ConcurrentBag<(Project, IAnalyzerResult)>(); 
 
-            Console.WriteLine("Building projects - starting");
-            
-            // Build projects in parallel — each invocation spawns an isolated MSBuild process
-            // so there is no shared mutable state between concurrent builds.
-            List<IAnalyzerResult?> results = manager.Projects.Values
-                .AsParallel()
-                .Select(p =>
-                {
-                    Console.WriteLine($"Building projects - {p.ProjectFile.Name} - starting");
-                    var result = p.Build().FirstOrDefault();
-                    Console.WriteLine($"Building projects - {p.ProjectFile.Name} - finished");
-                    return result;
-                })
-                .Where(x => x != null)
-                .ToList();
-            Console.WriteLine("Building projects - finished.");
-
-            // Create a new workspace and add the solution (if there was one)
-            AdhocWorkspace workspace = new AdhocWorkspace();
-            if (!string.IsNullOrEmpty(manager.SolutionFilePath))
+            var workspace = CreateWorkspace(manager);
+            var projects = new List<(Project, IAnalyzerResult)>();
+            await foreach (var item in StreamProjectsAsync(manager, workspace))
             {
-                SolutionInfo solutionInfo = SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, manager.SolutionFilePath);
-                workspace.AddSolution(solutionInfo);
-
-                // Sort the projects so the order that they're added to the workspace in the same order as the solution file
-                List<ProjectInSolution> projectsInOrder = [.. manager.SolutionFile.ProjectsInOrder];
-                results = [.. results.OrderBy(p => projectsInOrder.FindIndex(g => g.AbsolutePath == p.ProjectFilePath))];
+                projects.Add(item);
             }
 
-            // Add each result to the new workspace (sorted in solution order above, if we have a solution).
-            // AdhocWorkspace mutations are not thread-safe, so this loop remains sequential.
-            Console.WriteLine("Loading projects into workspace - starting");
-            foreach (IAnalyzerResult result in results)
+            return new AnalysisContext(workspace, projects);
+        }
+
+        // Launches all MSBuild design-time builds in parallel (Build stage), then as each
+        // completes feeds it sequentially into the Roslyn AdhocWorkspace (Load stage), and
+        // yields the (Project, IAnalyzerResult) pair immediately — without waiting for all
+        // projects to finish first.
+        //
+        // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential while
+        // the underlying builds run concurrently on the thread pool.
+        private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
+            IAnalyzerManager manager, AdhocWorkspace workspace)
+        {
+            // Build stage: launch all MSBuild design-time builds concurrently
+            List<Task<IAnalyzerResult?>> buildTasks = manager.Projects.Values
+                .Select(p => Task.Run<IAnalyzerResult?>(() =>
+                {
+                    Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                    var result = p.Build().FirstOrDefault();
+                    Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                    return result;
+                }))
+                .ToList();
+
+            // Load stage: as each build completes, add it to the workspace immediately
+            await foreach (var completedTask in Task.WhenEach(buildTasks))
             {
-                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - starting");
-                var existingProject = workspace.CurrentSolution.Projects.FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
+                var result = await completedTask;
+                if (result is null) continue;
+
+                Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - starting");
+                var existingProject = workspace.CurrentSolution.Projects
+                    .FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
                 if (existingProject is null)
                 {
                     // AddToWorkspace with addProjectReferences: true eagerly adds referenced projects
                     // into the workspace. Those will be picked up via existingProject on their own
-                    // loop iteration below.
+                    // iteration below.
                     var project = result.AddToWorkspace(workspace, true);
-                    projectResults.Add((project, result));
+                    Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - finished");
+                    yield return (project, result);
                 }
                 else
                 {
                     // Already in the workspace because an earlier project pulled it in as a
                     // transitive reference. Still include it so it gets CONTAINS triples and
                     // is analyzed — just reuse the workspace Project object already there.
-                    projectResults.Add((existingProject, result));
+                    Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - finished");
+                    yield return (existingProject, result);
                 }
-                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - finished");
             }
-            Console.WriteLine("Loading projects into workspace - finished");
+        }
 
-            return new AnalysisContext(workspace, projectResults.ToList());
+        private static AdhocWorkspace CreateWorkspace(IAnalyzerManager manager)
+        {
+            var workspace = new AdhocWorkspace();
+            if (!string.IsNullOrEmpty(manager.SolutionFilePath))
+            {
+                SolutionInfo solutionInfo = SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, manager.SolutionFilePath);
+                workspace.AddSolution(solutionInfo);
+            }
+            return workspace;
         }
 
         private static async Task<IList<Triple>> AnalyzeProject(int index, (Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)

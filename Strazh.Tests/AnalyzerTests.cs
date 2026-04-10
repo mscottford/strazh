@@ -1,6 +1,7 @@
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using Buildalyzer;
 using Strazh.Analysis;
 using Xunit;
@@ -21,12 +22,12 @@ public class AnalyzerTests
     /// fix, ProjectB's loop iteration finds it already in the workspace and is dropped.
     /// </summary>
     [Fact]
-    public void GetAnalysisContext_IncludesProjectsAddedAsTransitiveReferences()
+    public async Task GetAnalysisContext_IncludesProjectsAddedAsTransitiveReferences()
     {
         var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
         var manager = new AnalyzerManager(solutionPath);
 
-        var context = Analyzer.GetAnalysisContext(manager);
+        var context = await Analyzer.GetAnalysisContext(manager);
 
         var projectFileNames = context.Projects
             .Select(p => Path.GetFileName(p.Item2.ProjectFilePath))
