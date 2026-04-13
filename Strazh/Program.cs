@@ -90,7 +90,7 @@ namespace Strazh
                 }
 
                 Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
-                await Analyzer.Analyze(config);
+                await Analyzer.Analyze(config, new SpectreConsoleProgress());
                 Console.WriteLine("Code Knowledge Graph created.");
             }
             catch (Exception ex)
