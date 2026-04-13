@@ -39,6 +39,11 @@ namespace Strazh.Analysis
                 await DbManager.DeleteData(config.Credentials);
             }
 
+            // Ensure uniqueness constraints (and their implicit indexes) exist for every node
+            // label before any MERGE operations run. Without indexes, each MERGE does a full
+            // label scan and performance degrades linearly as the database grows.
+            await DbManager.EnsureIndexes(config.Credentials);
+
             var workspace = CreateWorkspace(manager);
 
             // Limit concurrent Neo4j connections to one per logical processor.
