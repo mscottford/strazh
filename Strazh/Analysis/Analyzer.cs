@@ -68,6 +68,18 @@ namespace Strazh.Analysis
                         var solutionNode = new SolutionNode(solutionName);
                         triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
 
+                        // Connect the project's folder to the solution's root folder so the folder
+                        // hierarchy is traversable from the solution downward. Without this triple,
+                        // project folder nodes are orphans — present in the graph but unreachable
+                        // from the solution folder via INCLUDED_IN traversal.
+                        var projectRoot = capturedEntry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
+                        if (!string.IsNullOrEmpty(projectRoot) &&
+                            !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var projectRootNode = new FolderNode(projectRoot, projectRoot);
+                            triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
+                        }
+
                         var projectNode = new ProjectNode(GetProjectName(capturedEntry.Item1.Name));
                         triples.Add(new TripleContains(solutionNode, projectNode));
                     }
@@ -234,6 +246,13 @@ namespace Strazh.Analysis
                     // into the workspace. Those will be picked up via existingProject on their own
                     // iteration below.
                     var project = result.AddToWorkspace(workspace, true);
+                    if (project is null)
+                    {
+                        // AddToWorkspace returns null for project types not supported by Roslyn
+                        // (e.g. F# projects, native projects). Skip them — they cannot be analyzed.
+                        Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - skipped (unsupported project type)");
+                        continue;
+                    }
                     Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - finished");
                     yield return (project, result);
                 }
