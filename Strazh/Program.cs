@@ -45,6 +45,12 @@ namespace Strazh
             };
             rootCommand.Options.Add(optionProjects);
 
+            var optionCache = new Option<string>("--cache")
+            {
+                Description = "optional path to a directory where MSBuild binary logs are cached; defaults to the platform application data folder (e.g. ~/Library/Application Support/strazh/cache on macOS)"
+            };
+            rootCommand.Options.Add(optionCache);
+
             rootCommand.SetAction(async (ParseResult parseResult, CancellationToken token) =>
             {
                 await BuildKnowledgeGraph(
@@ -52,13 +58,14 @@ namespace Strazh
                     parseResult.GetValue(optionMode),
                     parseResult.GetValue(optionDelete),
                     parseResult.GetValue(optionSolution),
-                    parseResult.GetValue(optionProjects));
+                    parseResult.GetValue(optionProjects),
+                    parseResult.GetValue(optionCache));
             });
 
             return await rootCommand.Parse(args).InvokeAsync();
         }
 
-        private static async Task BuildKnowledgeGraph(string credentials, string tier, string delete, string solution, string[] projects)
+        private static async Task BuildKnowledgeGraph(string credentials, string tier, string delete, string solution, string[] projects, string? cacheDirectory = null)
         {
             try
             {
@@ -67,7 +74,8 @@ namespace Strazh
                        tier,
                        delete,
                        solution,
-                       projects
+                       projects,
+                       cacheDirectory
                    );
                 if (!config.IsValid)
                 {

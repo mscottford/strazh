@@ -1,4 +1,7 @@
-﻿namespace Strazh.Analysis
+﻿using System;
+using System.IO;
+
+namespace Strazh.Analysis
 {
     public class AnalyzerConfig
     {
@@ -35,13 +38,14 @@
         public string Solution { get; }
         public string[] Projects { get; }
         public bool IsDelete { get; }
+        public string? CacheDirectory { get; }
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
 
         public bool IsValid => (!string.IsNullOrEmpty(Solution) && Projects.Length == 0)
             || (string.IsNullOrEmpty(Solution) && Projects.Length > 0);
 
-        public AnalyzerConfig(string credentials, string tier, string delete, string solution, string[] projects)
+        public AnalyzerConfig(string credentials, string tier, string delete, string solution, string[] projects, string? cacheDirectory = null)
         {
             solution = solution == "none" ? "" : solution;
             Credentials = new CredentialsConfig(credentials);
@@ -49,6 +53,9 @@
             IsDelete = delete != "false";
             Solution = solution;
             Projects = projects ?? new string[] { };
+            CacheDirectory = string.IsNullOrEmpty(cacheDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "strazh", "cache")
+                : cacheDirectory;
         }
 
         private Tiers MapTier(string mode)
