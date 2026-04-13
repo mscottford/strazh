@@ -1,4 +1,7 @@
+using System;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Strazh.Domain
 {
@@ -24,7 +27,17 @@ namespace Strazh.Domain
 
         protected virtual void SetPrimaryKey()
         {
-            Pk = FullName.GetHashCode().ToString();
+            Pk = DeterministicHash(FullName);
+        }
+
+        // string.GetHashCode() is randomized per-process in .NET Core and later, so using it
+        // as a Neo4j pk causes every run to generate different values for the same node,
+        // defeating MERGE and creating duplicate nodes. MD5 gives a stable, collision-resistant
+        // identifier across runs. (This is not a security use — stability is all that matters.)
+        protected static string DeterministicHash(string value)
+        {
+            var bytes = MD5.HashData(Encoding.UTF8.GetBytes(value));
+            return Convert.ToHexString(bytes);
         }
 
         public virtual string Set(string node) => 
@@ -80,7 +93,7 @@ namespace Strazh.Domain
 
         protected override void SetPrimaryKey()
         {
-            Pk = $"{FullName}{Arguments}{ReturnType}".GetHashCode().ToString();
+            Pk = DeterministicHash($"{FullName}{Arguments}{ReturnType}");
         }
     }
 
@@ -127,7 +140,7 @@ namespace Strazh.Domain
 
         protected override void SetPrimaryKey()
         {
-            Pk = $"{FullName}{Version}".GetHashCode().ToString();
+            Pk = DeterministicHash($"{FullName}{Version}");
         }
     }
 }
