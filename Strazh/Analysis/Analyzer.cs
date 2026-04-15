@@ -216,6 +216,16 @@ namespace Strazh.Analysis
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true);
                                 result = manager.Analyze(binlogPath).FirstOrDefault();
+                                if (result == null)
+                                {
+                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "cached build log could not be read");
+                                    return null;
+                                }
+                                // Keep the sidecar in sync with the binlog even on a cache hit.
+                                // Without this, a project whose build previously timed out (leaving
+                                // the deps file from an older run) would carry stale dependency
+                                // information into the next staleness-propagation pass.
+                                WriteDepsFile(binlogPath, result);
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                         }
