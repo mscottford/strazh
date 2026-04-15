@@ -9,22 +9,20 @@ namespace Strazh.Database
 {
     public static class DbManager
     {
-        private const string CONNECTION = "neo4j://localhost:7687";
-
         // All node labels that carry a pk property used as the MERGE key.
         // A uniqueness constraint implicitly creates a B-tree index, turning each
         // MERGE (n:Label { pk: "..." }) from a full label scan into an index lookup.
         private static readonly string[] NodeLabels =
             ["Class", "Interface", "Method", "File", "Folder", "Solution", "Project", "Package"];
 
-        public static async Task EnsureIndexes(CredentialsConfig credentials)
+        public static async Task EnsureIndexes(CredentialsConfig credentials, string neo4jUrl)
         {
             if (credentials == null)
             {
                 throw new ArgumentException($"Please, provide credentials.");
             }
             Console.WriteLine("Ensuring Neo4j uniqueness constraints and indexes...");
-            await using var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
+            await using var driver = GraphDatabase.Driver(neo4jUrl, AuthTokens.Basic(credentials.User, credentials.Password));
             await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
             foreach (var label in NodeLabels)
             {
@@ -34,26 +32,26 @@ namespace Strazh.Database
             Console.WriteLine("Neo4j uniqueness constraints and indexes ready.");
         }
 
-        public static async Task DeleteData(CredentialsConfig credentials)
+        public static async Task DeleteData(CredentialsConfig credentials, string neo4jUrl)
         {
             if (credentials == null)
             {
                 throw new ArgumentException($"Please, provide credentials.");
             }
             Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database...");
-            await using var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
+            await using var driver = GraphDatabase.Driver(neo4jUrl, AuthTokens.Basic(credentials.User, credentials.Password));
             await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
             await session.RunAsync("MATCH (n) DETACH DELETE n;");
             Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database complete.");
         }
 
-        public static async Task InsertData(IList<Triple> triples, CredentialsConfig credentials)
+        public static async Task InsertData(IList<Triple> triples, CredentialsConfig credentials, string neo4jUrl)
         {
             if (credentials == null)
             {
                 throw new ArgumentException($"Please, provide credentials.");
             }
-            await using var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
+            await using var driver = GraphDatabase.Driver(neo4jUrl, AuthTokens.Basic(credentials.User, credentials.Password));
             await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
             try
             {

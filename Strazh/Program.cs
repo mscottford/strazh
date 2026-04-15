@@ -64,6 +64,12 @@ namespace Strazh
             };
             rootCommand.Options.Add(optionBuildLogDir);
 
+            var optionNeo4jUrl = new Option<string>("--neo4j-url", "-u")
+            {
+                Description = "optional connection URL for the Neo4j database (default `neo4j://localhost:7687`)"
+            };
+            rootCommand.Options.Add(optionNeo4jUrl);
+
             rootCommand.SetAction(async (ParseResult parseResult, CancellationToken token) =>
             {
                 await BuildKnowledgeGraph(new AnalyzerConfig.Options(
@@ -74,7 +80,8 @@ namespace Strazh
                     Projects: parseResult.GetValue(optionProjects),
                     CacheDirectory: parseResult.GetValue(optionCache),
                     NoCache: parseResult.GetValue(optionNoCache),
-                    BuildLogDirectory: parseResult.GetValue(optionBuildLogDir)
+                    BuildLogDirectory: parseResult.GetValue(optionBuildLogDir),
+                    Neo4jUrl: parseResult.GetValue(optionNeo4jUrl)
                 ));
             });
 
@@ -91,7 +98,7 @@ namespace Strazh
                     Console.WriteLine("Please submit only one thing: `--solution` (-s) or `--projects` (-p)");
                     return;
                 }
-                var isNeo4jReady = await Healthcheck.IsNeo4jReady();
+                var isNeo4jReady = await Healthcheck.IsNeo4jReady(config.Neo4jUrl);
                 if (!isNeo4jReady)
                 {
                     Console.WriteLine("Strazh failed to start. There is no Neo4j instance ready to use.");

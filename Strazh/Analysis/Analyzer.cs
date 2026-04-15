@@ -37,13 +37,13 @@ namespace Strazh.Analysis
             // races against the delete.
             if (config.IsDelete)
             {
-                await DbManager.DeleteData(config.Credentials);
+                await DbManager.DeleteData(config.Credentials, config.Neo4jUrl);
             }
 
             // Ensure uniqueness constraints (and their implicit indexes) exist for every node
             // label before any MERGE operations run. Without indexes, each MERGE does a full
             // label scan and performance degrades linearly as the database grows.
-            await DbManager.EnsureIndexes(config.Credentials);
+            await DbManager.EnsureIndexes(config.Credentials, config.Neo4jUrl);
 
             var workspace = CreateWorkspace(manager);
 
@@ -118,7 +118,7 @@ namespace Strazh.Analysis
                         await semaphore.WaitAsync();
                         try
                         {
-                            await DbManager.InsertData(triples, config.Credentials);
+                            await DbManager.InsertData(triples, config.Credentials, config.Neo4jUrl);
                         }
                         finally
                         {
