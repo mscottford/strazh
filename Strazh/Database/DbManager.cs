@@ -13,7 +13,7 @@ namespace Strazh.Database
         // A uniqueness constraint implicitly creates a B-tree index, turning each
         // MERGE (n:Label { pk: "..." }) from a full label scan into an index lookup.
         private static readonly string[] NodeLabels =
-            ["Class", "Interface", "Method", "File", "Folder", "Solution", "Project", "Package"];
+            ["Class", "Interface", "Method", "File", "Folder", "Solution", "Project", "Package", "Repository"];
 
         public static async Task EnsureIndexes(CredentialsConfig credentials, string neo4jUrl)
         {

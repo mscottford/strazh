@@ -122,6 +122,11 @@ namespace Strazh.Domain
         public override string Label { get; } = "Project";
     }
 
+    public class RepositoryNode(string name) : Node(name, name)
+    {
+        public override string Label { get; } = "Repository";
+    }
+
     public class PackageNode : Node
     {
         public PackageNode(string fullName, string name, string version)

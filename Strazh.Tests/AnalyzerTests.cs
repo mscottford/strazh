@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Buildalyzer;
 using Strazh.Analysis;
+using Strazh.Domain;
 using Xunit;
 
 namespace Strazh.Tests;
@@ -130,6 +131,44 @@ public class AnalyzerTests
                 exp.PackageReferences.Keys.OrderBy(x => x).ToList(),
                 act.PackageReferences.Keys.OrderBy(x => x).ToList());
         }
+    }
+
+    /// <summary>
+    /// Verifies that analyzing a solution creates a Repository node and the
+    /// Folder(repoShortName) -INCLUDED_IN-> Repository(owner/repo) triple.
+    ///
+    /// The expected repository name is read from the git remote "origin" of the
+    /// containing repository, so the test passes unchanged on both the upstream
+    /// repo (vladbatushkov/strazh) and any fork (e.g. mscottford/strazh).
+    /// </summary>
+    [Fact]
+    public async Task Analyze_CreatesRepositoryNodeAndFolderIncludedInTriple()
+    {
+        var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
+        var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+            Credentials: "",
+            Tier: "project",
+            Delete: "false",
+            Solution: solutionPath,
+            Projects: Array.Empty<string>()
+        ));
+        var store = new InMemoryTripleStore();
+
+        await Analyzer.Analyze(config, NullAnalysisProgress.Instance, store);
+
+        var triples = store.Triples;
+
+        var expectedRepoName = GitHelper.GetRepositoryName(solutionPath);
+        Assert.NotNull(expectedRepoName);
+
+        var expectedFolderName = expectedRepoName.Split('/').Last();
+
+        var repoTriple = triples.FirstOrDefault(t =>
+            t.NodeA is FolderNode folder && folder.Name == expectedFolderName &&
+            t.NodeB is RepositoryNode repo && repo.FullName == expectedRepoName &&
+            t.Relationship.Type == "INCLUDED_IN");
+
+        Assert.NotNull(repoTriple);
     }
 
     // [CallerFilePath] gives the compile-time absolute path of this source file.

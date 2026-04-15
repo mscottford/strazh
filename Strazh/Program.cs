@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Strazh.Analysis;
+using Strazh.Database;
 
 namespace Strazh
 {
@@ -111,7 +112,8 @@ namespace Strazh
                     $"strazh-run-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
                 using var fileProgress = new FileAnalysisProgress(runLogPath);
                 var progress = new CompositeAnalysisProgress(new SpectreConsoleProgress(), fileProgress);
-                await Analyzer.Analyze(config, progress);
+                var store = new Neo4jTripleStore(config.Credentials, config.Neo4jUrl);
+                await Analyzer.Analyze(config, progress, store);
                 Console.WriteLine("Code Knowledge Graph created.");
             }
             catch (Exception ex)

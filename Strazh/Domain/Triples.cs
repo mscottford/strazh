@@ -52,6 +52,12 @@ namespace Strazh.Domain
             : base(contentA, contentB, new IncludedInRelationship())
         { }
 
+        public TripleIncludedIn(
+            FolderNode folder,
+            RepositoryNode repository)
+            : base(folder, repository, new IncludedInRelationship())
+        { }
+
     }
     
     public class TripleContains(
