@@ -5,6 +5,7 @@ using System.Linq;
 using Microsoft.CodeAnalysis;
 using Strazh.Domain;
 using Buildalyzer;
+using Buildalyzer.Environment;
 using Buildalyzer.Workspaces;
 using System.Collections.Generic;
 using System;
@@ -204,12 +205,25 @@ namespace Strazh.Analysis
                             if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path))
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                                p.AddBinaryLogger(binlogPath);
-                                result = p.Build().FirstOrDefault();
-                                if (result != null)
+                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(GetProjectName(p.ProjectFile.Name), binlogPath));
+                                if (timedOut)
                                 {
-                                    WriteDepsFile(binlogPath, result);
+                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build timed out");
+                                    return null;
                                 }
+                                // Read from the binlog rather than the pipe result. The pipe uses
+                                // MsBuildPipeLogger, which may not support the event types emitted by
+                                // the SDK's MSBuild version, leaving the pipe result empty even on a
+                                // successful build. The binlog is written natively by MSBuild and read
+                                // by StructuredLogger, which handles the current format regardless of
+                                // version skew.
+                                result = await TryAnalyzeBinlogAsync(manager, binlogPath);
+                                if (result == null)
+                                {
+                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build failed");
+                                    return null;
+                                }
+                                WriteDepsFile(binlogPath, result);
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                             else
@@ -232,7 +246,14 @@ namespace Strazh.Analysis
                         else
                         {
                             callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                            result = p.Build().FirstOrDefault();
+                            var (buildResult2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(GetProjectName(p.ProjectFile.Name)));
+                            result = buildResult2;
+                            if (result == null)
+                            {
+                                var reason = timedOut2 ? "build timed out" : "build failed";
+                                callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
+                                return null;
+                            }
                             callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                         }
                         return result;
@@ -319,6 +340,51 @@ namespace Strazh.Analysis
             }
 
             return sorted;
+        }
+
+        // If a build hangs (e.g. Android/MAUI projects waiting on SDK tools not present in the
+        // environment), WhenAny returns after the timeout and we skip the project. The underlying
+        // Task.Run continues to hold its thread until the process eventually exits or is reaped
+        // when the parent process terminates — that is acceptable.
+        private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(5);
+
+        // Reads the binlog, retrying once after a short delay if the first attempt yields no
+        // results. The MSBuild child process closes its stdout pipe (causing p.Build() to return)
+        // before the BinaryLogger's file write is guaranteed to be fully flushed to disk. A single
+        // retry covers the common case where the OS buffers have not yet been committed.
+        private static async Task<IAnalyzerResult?> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
+        {
+            var result = manager.Analyze(binlogPath).FirstOrDefault();
+            if (result is not null)
+            {
+                return result;
+            }
+            await Task.Delay(500).ConfigureAwait(false);
+            return manager.Analyze(binlogPath).FirstOrDefault();
+        }
+
+        private static async Task<(IAnalyzerResult? result, bool timedOut)> BuildWithTimeoutAsync(IProjectAnalyzer p, EnvironmentOptions opts)
+        {
+            var buildTask = Task.Run(() => p.Build(opts).FirstOrDefault());
+            if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
+            {
+                return (null, timedOut: true);
+            }
+            return (await buildTask.ConfigureAwait(false), timedOut: false);
+        }
+
+        private static EnvironmentOptions CreateBuildOptions(string projectName, string? binlogPath = null)
+        {
+            var opts = new EnvironmentOptions();
+            opts.Arguments.Add("/nodeReuse:false");
+            if (binlogPath != null)
+            {
+                // MSBuild writes the binlog directly in the child process. This avoids running the
+                // BinaryLogger on the host-side pipe, which can cause deserialization errors when the
+                // SDK's MSBuild version is newer than the MsBuildPipeLogger the host uses.
+                opts.Arguments.Add($"\"/bl:{binlogPath}\"");
+            }
+            return opts;
         }
 
         private static AdhocWorkspace CreateWorkspace(IAnalyzerManager manager)
