@@ -62,7 +62,7 @@ namespace Strazh.Analysis
                         OnBuildStarted = (path, name, isCacheHit) => progress.OnBuildStarted(path, name, isCacheHit),
                         OnBuildCompleted = path => progress.OnBuildCompleted(path),
                         OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason)
-                    }))
+                    }, config.NoCache, config.BuildLogDirectory))
                 {
                     var capturedEntry = entry;
                     var projectPath = capturedEntry.Item2.ProjectFilePath;
