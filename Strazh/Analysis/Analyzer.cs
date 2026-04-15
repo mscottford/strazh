@@ -18,7 +18,7 @@ namespace Strazh.Analysis
 {
     public static class Analyzer
     {
-        public static async Task Analyze(AnalyzerConfig config)
+        public static async Task Analyze(AnalyzerConfig config, IAnalysisProgress progress)
         {
             Console.WriteLine($"Setup analyzer...");
 
@@ -39,102 +39,98 @@ namespace Strazh.Analysis
                 await DbManager.DeleteData(config.Credentials);
             }
 
+            // Ensure uniqueness constraints (and their implicit indexes) exist for every node
+            // label before any MERGE operations run. Without indexes, each MERGE does a full
+            // label scan and performance degrades linearly as the database grows.
+            await DbManager.EnsureIndexes(config.Credentials);
+
             var workspace = CreateWorkspace(manager);
 
             // Limit concurrent Neo4j connections to one per logical processor.
             var semaphore = new SemaphoreSlim(Environment.ProcessorCount);
-            var total = projectAnalyzers.Count;
-            var tasks = new List<Task>();
-            var index = 0;
+            var analysisTasks = new List<Task>();
 
             // Stream projects through the Build → Load pipeline and launch an Analyze + Insert
             // task for each one as soon as it becomes available, without waiting for all
             // projects to finish building and loading first.
-            await foreach (var entry in StreamProjectsAsync(manager, workspace, config.CacheDirectory))
+            await progress.WrapAsync(projectAnalyzers.Count, async () =>
             {
-                var capturedEntry = entry;
-                var capturedIndex = index++;
-
-                tasks.Add(Task.Run(async () =>
+                await foreach (var entry in StreamProjectsAsync(manager, workspace, config.CacheDirectory,
+                    new StreamCallbacks
+                    {
+                        OnBuildStarted = (path, name, isCacheHit) => progress.OnBuildStarted(path, name, isCacheHit),
+                        OnBuildCompleted = path => progress.OnBuildCompleted(path),
+                        OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason)
+                    }))
                 {
-                    var triples = new List<Triple>();
+                    var capturedEntry = entry;
+                    var projectPath = capturedEntry.Item2.ProjectFilePath;
+                    var projectDisplayName = GetProjectName(capturedEntry.Item1.Name);
 
-                    if (config.IsSolutionBased)
+                    progress.OnStageChanged(projectPath, projectDisplayName, "Analyzing");
+
+                    analysisTasks.Add(Task.Run(async () =>
                     {
-                        var solutionRoot = GetRoot(manager.SolutionFilePath);
-                        var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
+                        var triples = new List<Triple>();
 
-                        var solutionName = GetSolutionName(manager.SolutionFilePath);
-                        var solutionNode = new SolutionNode(solutionName);
-                        triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
-
-                        // Connect the project's folder to the solution's root folder so the folder
-                        // hierarchy is traversable from the solution downward. Without this triple,
-                        // project folder nodes are orphans — present in the graph but unreachable
-                        // from the solution folder via INCLUDED_IN traversal.
-                        var projectRoot = capturedEntry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
-                        if (!string.IsNullOrEmpty(projectRoot) &&
-                            !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
+                        if (config.IsSolutionBased)
                         {
-                            var projectRootNode = new FolderNode(projectRoot, projectRoot);
-                            triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
-                        }
+                            var solutionRoot = GetRoot(manager.SolutionFilePath);
+                            var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
 
-                        var projectNode = new ProjectNode(GetProjectName(capturedEntry.Item1.Name));
-                        triples.Add(new TripleContains(solutionNode, projectNode));
-                    }
+                            var solutionName = GetSolutionName(manager.SolutionFilePath);
+                            var solutionNode = new SolutionNode(solutionName);
+                            triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
 
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: analyze - starting");
-                    var projectTriples = await AnalyzeProject(capturedIndex + 1, capturedEntry, config.Tier);
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: analyze - finished");
-
-                    triples.AddRange(projectTriples);
-
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: grouping - starting");
-                    try
-                    {
-                        triples = triples.GroupBy(x => x.ToString()).Select(x => x.First()).OrderBy(x => x.NodeA.Label)
-                            .ToList();
-                    }
-                    catch (Exception)
-                    {
-                        Console.WriteLine("Error detected. Dumping detailed logging data.");
-                        Console.WriteLine("[");
-                        var first = true;
-                        foreach (var triple in triples)
-                        {
-                            if (!first)
+                            // Connect the project's folder to the solution's root folder so the folder
+                            // hierarchy is traversable from the solution downward. Without this triple,
+                            // project folder nodes are orphans — present in the graph but unreachable
+                            // from the solution folder via INCLUDED_IN traversal.
+                            var projectRoot = capturedEntry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
+                            if (!string.IsNullOrEmpty(projectRoot) &&
+                                !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
                             {
-                                Console.WriteLine(",");
+                                var projectRootNode = new FolderNode(projectRoot, projectRoot);
+                                triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
                             }
-                            Console.Write($$"""{ "triple": {{ triple.ToInspection()}} }""");
 
-                            first = false;
+                            var projectNode = new ProjectNode(GetProjectName(capturedEntry.Item1.Name));
+                            triples.Add(new TripleContains(solutionNode, projectNode));
                         }
-                        if (triples.Any())
+
+                        var projectTriples = await AnalyzeProject(capturedEntry, config.Tier);
+                        triples.AddRange(projectTriples);
+
+                        progress.OnStageChanged(projectPath, projectDisplayName, "Grouping");
+                        try
                         {
-                            Console.WriteLine("");
+                            triples = triples.GroupBy(x => x.ToString()).Select(x => x.First()).OrderBy(x => x.NodeA.Label)
+                                .ToList();
                         }
-                        Console.WriteLine("]");
-                        throw;
-                    }
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: grouping - finished");
+                        catch (Exception)
+                        {
+                            progress.OnGroupingError(projectDisplayName, triples);
+                            throw;
+                        }
 
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: insert - starting");
-                    await semaphore.WaitAsync();
-                    try
-                    {
-                        await DbManager.InsertData(triples, config.Credentials);
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                    Console.WriteLine($"+ [{capturedIndex + 1}/{total}] {capturedEntry.Item1.Name}: insert - finished");
-                }));
-            }
+                        progress.OnStageChanged(projectPath, projectDisplayName, "Inserting");
+                        await semaphore.WaitAsync();
+                        try
+                        {
+                            await DbManager.InsertData(triples, config.Credentials);
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
 
-            await Task.WhenAll(tasks);
+                        progress.OnProjectCompleted(projectPath, triples.Count);
+                    }));
+                }
+
+                await Task.WhenAll(analysisTasks);
+            });
+
             workspace.Dispose();
         }
 
@@ -174,8 +170,16 @@ namespace Strazh.Analysis
         // complete first avoids the race while still streaming Load → Analyze.
         //
         // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential.
+        private readonly struct StreamCallbacks
+        {
+            public Action<string, string, bool>? OnBuildStarted { get; init; }
+            public Action<string>? OnBuildCompleted { get; init; }
+            public Action<string, string, string>? OnProjectSkipped { get; init; }
+        }
+
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
-            IAnalyzerManager manager, AdhocWorkspace workspace, string? cacheDirectory = null)
+            IAnalyzerManager manager, AdhocWorkspace workspace, string? cacheDirectory = null,
+            StreamCallbacks callbacks = default)
         {
             HashSet<string>? projectsNeedingRebuild = null;
             if (cacheDirectory != null)
@@ -199,26 +203,27 @@ namespace Strazh.Analysis
                             var binlogPath = GetBinlogCachePath(cacheDirectory, p);
                             if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path))
                             {
-                                Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
                                 p.AddBinaryLogger(binlogPath);
                                 result = p.Build().FirstOrDefault();
                                 if (result != null)
                                 {
                                     WriteDepsFile(binlogPath, result);
                                 }
-                                Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                             else
                             {
-                                Console.WriteLine($"Build - {p.ProjectFile.Name} - cache hit");
+                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true);
                                 result = manager.Analyze(binlogPath).FirstOrDefault();
+                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                         }
                         else
                         {
-                            Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                            callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
                             result = p.Build().FirstOrDefault();
-                            Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                            callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                         }
                         return result;
                     }
@@ -229,15 +234,17 @@ namespace Strazh.Analysis
                 })));
 
             // Load stage: add each completed result to the workspace and yield immediately,
-            // so analysis can begin on each project without waiting for all to be loaded
-            foreach (var result in results)
+            // so analysis can begin on each project without waiting for all to be loaded.
+            // Results are sorted in dependency order so every project's references are already
+            // in the workspace when AddToWorkspace runs, preventing it from triggering redundant
+            // MSBuild builds for references it cannot find there yet.
+            foreach (var result in TopologicalSort(results))
             {
                 if (result is null)
                 {
                     continue;
                 }
 
-                Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - starting");
                 var existingProject = workspace.CurrentSolution.Projects
                     .FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
                 if (existingProject is null)
@@ -250,10 +257,9 @@ namespace Strazh.Analysis
                     {
                         // AddToWorkspace returns null for project types not supported by Roslyn
                         // (e.g. F# projects, native projects). Skip them — they cannot be analyzed.
-                        Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - skipped (unsupported project type)");
+                        callbacks.OnProjectSkipped?.Invoke(result.ProjectFilePath, Path.GetFileName(result.ProjectFilePath), "unsupported project type");
                         continue;
                     }
-                    Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - finished");
                     yield return (project, result);
                 }
                 else
@@ -261,10 +267,48 @@ namespace Strazh.Analysis
                     // Already in the workspace because an earlier project pulled it in as a
                     // transitive reference. Still include it so it gets CONTAINS triples and
                     // is analyzed — just reuse the workspace Project object already there.
-                    Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - finished");
                     yield return (existingProject, result);
                 }
             }
+        }
+
+        // Sorts build results so that every project appears after all of its project
+        // references that are also in the result set. Without this ordering,
+        // AddToWorkspace(addProjectReferences: true) encounters references not yet in
+        // the workspace and calls analyzer.Build() on them — bypassing our binlog cache
+        // and running full, sequential in-process MSBuild evaluations for each one.
+        // A DFS post-order traversal over the dependency graph produces the correct order.
+        private static IReadOnlyList<IAnalyzerResult> TopologicalSort(IAnalyzerResult?[] results)
+        {
+            var byPath = results
+                .Where(r => r is not null)
+                .ToDictionary(r => r!.ProjectFilePath, r => r!, StringComparer.OrdinalIgnoreCase);
+
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sorted = new List<IAnalyzerResult>(byPath.Count);
+
+            void Visit(IAnalyzerResult result)
+            {
+                if (!visited.Add(result.ProjectFilePath))
+                {
+                    return;
+                }
+                foreach (var refPath in result.ProjectReferences)
+                {
+                    if (byPath.TryGetValue(refPath, out var refResult))
+                    {
+                        Visit(refResult);
+                    }
+                }
+                sorted.Add(result);
+            }
+
+            foreach (var result in byPath.Values)
+            {
+                Visit(result);
+            }
+
+            return sorted;
         }
 
         private static AdhocWorkspace CreateWorkspace(IAnalyzerManager manager)
@@ -380,18 +424,15 @@ namespace Strazh.Analysis
             return needsRebuild;
         }
 
-        private static async Task<IList<Triple>> AnalyzeProject(int index, (Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
+        private static async Task<IList<Triple>> AnalyzeProject((Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
         {
-            Console.WriteLine($"Project #{index}:");
             var root = GetRoot(item.project.FilePath);
             var rootNode = new FolderNode(root, root);
             var projectName = GetProjectName(item.project.Name);
-            Console.WriteLine($"Analyzing {projectName} project...");
 
             var triples = new List<Triple>();
             if (mode == Tiers.All || mode == Tiers.Project)
             {
-                Console.WriteLine($"Analyzing Project tier...");
                 var projectNode = new ProjectNode(projectName);
                 triples.Add(new TripleIncludedIn(projectNode, rootNode));
                 item.projectAnalyzerResult.ProjectReferences.ToList().ForEach(x =>
@@ -405,13 +446,11 @@ namespace Strazh.Analysis
                     var node = new PackageNode(x.Key, x.Key, version);
                     triples.Add(new TripleDependsOnPackage(projectNode, node));
                 });
-                Console.WriteLine($"Analyzing Project tier complete.");
             }
 
             if (item.project.SupportsCompilation
                 && (mode == Tiers.All || mode == Tiers.Code))
             {
-                Console.WriteLine($"Analyzing Code tier...");
                 var compilation = await item.project.GetCompilationAsync();
                 var syntaxTreeRoot = compilation.SyntaxTrees.Where(x => !x.FilePath.Contains("obj"));
                 foreach (var st in syntaxTreeRoot)
@@ -420,10 +459,8 @@ namespace Strazh.Analysis
                     Extractor.AnalyzeTree<InterfaceDeclarationSyntax>(triples, st, sem, rootNode);
                     Extractor.AnalyzeTree<ClassDeclarationSyntax>(triples, st, sem, rootNode);
                 }
-                Console.WriteLine($"Analyzing Code tier complete.");
             }
 
-            Console.WriteLine($"Analyzing {projectName} project complete.");
             return triples;
         }
         
