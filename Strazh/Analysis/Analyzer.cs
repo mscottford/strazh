@@ -39,8 +39,8 @@ namespace Strazh.Analysis
 
             var workspace = CreateWorkspace(manager);
 
-            // Limit concurrent Neo4j connections to avoid exhausting the connection pool.
-            var semaphore = new SemaphoreSlim(4);
+            // Limit concurrent Neo4j connections to one per logical processor.
+            var semaphore = new SemaphoreSlim(Environment.ProcessorCount);
             var total = projectAnalyzers.Count;
             var tasks = new List<Task>();
             var index = 0;
