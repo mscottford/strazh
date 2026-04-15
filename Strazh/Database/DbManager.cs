@@ -18,8 +18,8 @@ namespace Strazh.Database
                 throw new ArgumentException($"Please, provide credentials.");
             }
             Console.WriteLine($"Code Knowledge Graph use \"{credentials.Database}\" Neo4j database.");
-            var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
-            var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
+            await using var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
+            await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
             try
             {
                 if (isDelete)
@@ -38,11 +38,6 @@ namespace Strazh.Database
             catch (Exception ex)
             {
                 Console.WriteLine(ex.Message);
-            }
-            finally
-            {
-                await session.CloseAsync();
-                await driver.CloseAsync();
             }
         }
     }

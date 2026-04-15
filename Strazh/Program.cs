@@ -1,53 +1,61 @@
-﻿using System;
+using System;
 using System.CommandLine;
-using System.CommandLine.Invocation;
-using Microsoft.Build.Logging.StructuredLogger;
+using System.Threading;
+using System.Threading.Tasks;
 using Strazh.Analysis;
-using Task = System.Threading.Tasks.Task;
 
 namespace Strazh
 {
     public class Program
     {
 
-        public static async Task Main(params string[] args)
+        public static async Task<int> Main(params string[] args)
         {
-#if DEBUG
-            // There is an issue with using Neo4j.Driver 4.2.0
-            // System.IO.FileNotFoundException: Could not load file or assembly '4.2.37.0'. The system cannot find the file specified.
-            // Workaround to load assembly and avoid issue 
-            System.Reflection.Assembly.Load("Neo4j.Driver");
-#endif
             var rootCommand = new RootCommand();
 
-            var optionCredentials = new Option<string>("--credentials", "required information in format `dbname:user:password` to connect to Neo4j Database");
-            optionCredentials.AddAlias("-c");
-            optionCredentials.IsRequired = true;
-            rootCommand.Add(optionCredentials);
+            var optionCredentials = new Option<string>("--credentials", "-c")
+            {
+                Description = "required information in format `dbname:user:password` to connect to Neo4j Database",
+                Required = true
+            };
+            rootCommand.Options.Add(optionCredentials);
 
-            var optionMode = new Option<string>("--tier", "optional flag as `project` or `code` or 'all' (default `all`) selected tier to scan in a codebase");
-            optionMode.AddAlias("-t");
-            optionMode.IsRequired = false;
-            rootCommand.Add(optionMode);
+            var optionMode = new Option<string>("--tier", "-t")
+            {
+                Description = "optional flag as `project` or `code` or 'all' (default `all`) selected tier to scan in a codebase"
+            };
+            rootCommand.Options.Add(optionMode);
 
-            var optionDelete = new Option<string>("--delete", "optional flag as `true` or `false` or no flag (default `true`) to delete data in graph before execution");
-            optionDelete.AddAlias("-d");
-            optionDelete.IsRequired = false;
-            rootCommand.Add(optionDelete);
+            var optionDelete = new Option<string>("--delete", "-d")
+            {
+                Description = "optional flag as `true` or `false` or no flag (default `true`) to delete data in graph before execution"
+            };
+            rootCommand.Options.Add(optionDelete);
 
-            var optionSolution = new Option<string>("--solution", "optional absolute path to only one `.sln` file (can't be used together with -p / --projects)");
-            optionSolution.AddAlias("-s");
-            optionSolution.IsRequired = false;
-            rootCommand.Add(optionSolution);
+            var optionSolution = new Option<string>("--solution", "-s")
+            {
+                Description = "optional absolute path to only one `.sln` file (can't be used together with -p / --projects)"
+            };
+            rootCommand.Options.Add(optionSolution);
 
-            var optionProjects = new Option<string[]>("--projects", "optional list of absolute path to one or many `.csproj` files (can't be used together with -s / --solution)");
-            optionProjects.AddAlias("-p");
-            optionProjects.IsRequired = false;
-            rootCommand.Add(optionProjects);
+            var optionProjects = new Option<string[]>("--projects", "-p")
+            {
+                Description = "optional list of absolute path to one or many `.csproj` files (can't be used together with -s / --solution)",
+                AllowMultipleArgumentsPerToken = true
+            };
+            rootCommand.Options.Add(optionProjects);
 
-            rootCommand.SetHandler(BuildKnowledgeGraph, optionCredentials, optionMode, optionDelete, optionSolution, optionProjects);
+            rootCommand.SetAction(async (ParseResult parseResult, CancellationToken token) =>
+            {
+                await BuildKnowledgeGraph(
+                    parseResult.GetValue(optionCredentials),
+                    parseResult.GetValue(optionMode),
+                    parseResult.GetValue(optionDelete),
+                    parseResult.GetValue(optionSolution),
+                    parseResult.GetValue(optionProjects));
+            });
 
-            await rootCommand.InvokeAsync(args);
+            return await rootCommand.Parse(args).InvokeAsync();
         }
 
         private static async Task BuildKnowledgeGraph(string credentials, string tier, string delete, string solution, string[] projects)
@@ -73,7 +81,7 @@ namespace Strazh
                     return;
                 }
 
-                Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");                
+                Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
                 await Analyzer.Analyze(config);
                 Console.WriteLine("Code Knowledge Graph created.");
             }
