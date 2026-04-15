@@ -1,5 +1,6 @@
 using System;
 using System.CommandLine;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Strazh.Analysis;
@@ -51,32 +52,40 @@ namespace Strazh
             };
             rootCommand.Options.Add(optionCache);
 
+            var optionNoCache = new Option<bool>("--no-cache")
+            {
+                Description = "when set, rebuilds all projects and writes fresh cache entries without reading any existing cached binlogs"
+            };
+            rootCommand.Options.Add(optionNoCache);
+
+            var optionBuildLogDir = new Option<string>("--build-log-dir")
+            {
+                Description = "optional path to a directory where per-project MSBuild build logs are written; defaults to the platform application data folder (e.g. ~/Library/Application Support/strazh/logs on macOS)"
+            };
+            rootCommand.Options.Add(optionBuildLogDir);
+
             rootCommand.SetAction(async (ParseResult parseResult, CancellationToken token) =>
             {
-                await BuildKnowledgeGraph(
-                    parseResult.GetValue(optionCredentials),
-                    parseResult.GetValue(optionMode),
-                    parseResult.GetValue(optionDelete),
-                    parseResult.GetValue(optionSolution),
-                    parseResult.GetValue(optionProjects),
-                    parseResult.GetValue(optionCache));
+                await BuildKnowledgeGraph(new AnalyzerConfig.Options(
+                    Credentials: parseResult.GetValue(optionCredentials),
+                    Tier: parseResult.GetValue(optionMode),
+                    Delete: parseResult.GetValue(optionDelete),
+                    Solution: parseResult.GetValue(optionSolution),
+                    Projects: parseResult.GetValue(optionProjects),
+                    CacheDirectory: parseResult.GetValue(optionCache),
+                    NoCache: parseResult.GetValue(optionNoCache),
+                    BuildLogDirectory: parseResult.GetValue(optionBuildLogDir)
+                ));
             });
 
             return await rootCommand.Parse(args).InvokeAsync();
         }
 
-        private static async Task BuildKnowledgeGraph(string credentials, string tier, string delete, string solution, string[] projects, string? cacheDirectory = null)
+        private static async Task BuildKnowledgeGraph(AnalyzerConfig.Options options)
         {
             try
             {
-                var config = new AnalyzerConfig(
-                       credentials,
-                       tier,
-                       delete,
-                       solution,
-                       projects,
-                       cacheDirectory
-                   );
+                var config = new AnalyzerConfig(options);
                 if (!config.IsValid)
                 {
                     Console.WriteLine("Please submit only one thing: `--solution` (-s) or `--projects` (-p)");
@@ -90,7 +99,12 @@ namespace Strazh
                 }
 
                 Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
-                await Analyzer.Analyze(config, new SpectreConsoleProgress());
+                var runLogPath = Path.Combine(
+                    config.BuildLogDirectory!,
+                    $"strazh-run-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
+                using var fileProgress = new FileAnalysisProgress(runLogPath);
+                var progress = new CompositeAnalysisProgress(new SpectreConsoleProgress(), fileProgress);
+                await Analyzer.Analyze(config, progress);
                 Console.WriteLine("Code Knowledge Graph created.");
             }
             catch (Exception ex)

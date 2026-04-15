@@ -27,6 +27,11 @@ namespace Strazh.Analysis
             new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, DateTime> _startTimes =
             new(StringComparer.OrdinalIgnoreCase);
+        // Console writes (above the live area) must all come from the ticker thread to avoid
+        // interleaving with ctx.Refresh(), which causes Spectre.Console to corrupt its cursor
+        // position and crash the ticker. Concurrent callers enqueue an action; the ticker
+        // drains the queue before each Refresh().
+        private readonly ConcurrentQueue<Action> _pendingWrites = new();
         private LiveDisplayContext? _ctx;
         private int _tick;
         private int _total;
@@ -54,6 +59,10 @@ namespace Strazh.Analysis
                             Interlocked.Increment(ref _tick);
                             if (!cts.IsCancellationRequested)
                             {
+                                while (_pendingWrites.TryDequeue(out var write))
+                                {
+                                    write();
+                                }
                                 ctx.Refresh();
                             }
                         }
@@ -76,7 +85,6 @@ namespace Strazh.Analysis
             var now = DateTime.UtcNow;
             _startTimes[projectFilePath] = now;
             _active[projectFilePath] = new TaskEntry(projectName, isCacheHit ? "Cached" : "Building", now, now);
-            _ctx?.Refresh();
         }
 
         public void OnBuildCompleted(string projectFilePath)
@@ -95,39 +103,60 @@ namespace Strazh.Analysis
             _active.TryRemove(projectFilePath, out _);
             var name = _names.TryGetValue(projectFilePath, out var n) ? n : projectFilePath;
             var elapsed = DateTime.UtcNow - (_startTimes.TryGetValue(projectFilePath, out var st) ? st : DateTime.UtcNow);
-            AnsiConsole.MarkupLine(
+            var markup =
                 $"[green]✓[/] [bold]{Markup.Escape(name)}[/]  " +
-                $"[dim]{FormatElapsed(elapsed)}[/]  {tripleCount} triples");
-            _ctx?.Refresh();
+                $"[dim]{FormatElapsed(elapsed)}[/]  {tripleCount} triples";
+            _pendingWrites.Enqueue(() => AnsiConsole.MarkupLine(markup));
         }
 
         public void OnProjectSkipped(string projectFilePath, string filename, string reason)
         {
             Interlocked.Increment(ref _completed);
             _active.TryRemove(projectFilePath, out _);
-            AnsiConsole.MarkupLine($"[yellow]Skipped[/] {Markup.Escape(filename)} ({Markup.Escape(reason)})");
-            _ctx?.Refresh();
+            string label;
+            if (reason.Contains("timed out"))
+            {
+                label = "[yellow]Timeout[/]";
+            }
+            else if (reason.Contains("could not be read"))
+            {
+                label = "[yellow]Unreadable[/]";
+            }
+            else if (reason.Contains("failed"))
+            {
+                label = "[red]Failed[/]";
+            }
+            else
+            {
+                label = "[yellow]Skipped[/]";
+            }
+            var markup = $"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})";
+            _pendingWrites.Enqueue(() => AnsiConsole.MarkupLine(markup));
         }
 
         public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples)
         {
-            AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");
-            AnsiConsole.WriteLine("[");
-            var first = true;
-            foreach (var triple in triples)
+            var capturedTriples = triples.ToList();
+            _pendingWrites.Enqueue(() =>
             {
-                if (!first)
+                AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");
+                AnsiConsole.WriteLine("[");
+                var first = true;
+                foreach (var triple in capturedTriples)
                 {
-                    AnsiConsole.WriteLine(",");
+                    if (!first)
+                    {
+                        AnsiConsole.WriteLine(",");
+                    }
+                    AnsiConsole.Write(new Text($$"""{ "triple": {{ triple.ToInspection()}} }"""));
+                    first = false;
                 }
-                AnsiConsole.Write($$"""{ "triple": {{ triple.ToInspection()}} }""");
-                first = false;
-            }
-            if (triples.Count > 0)
-            {
-                AnsiConsole.WriteLine("");
-            }
-            AnsiConsole.WriteLine("]");
+                if (capturedTriples.Count > 0)
+                {
+                    AnsiConsole.WriteLine("");
+                }
+                AnsiConsole.WriteLine("]");
+            });
         }
 
         private void UpdateEntry(string projectFilePath, string stage)
@@ -135,7 +164,6 @@ namespace Strazh.Analysis
             if (_active.TryGetValue(projectFilePath, out var entry))
             {
                 _active[projectFilePath] = entry with { Stage = stage, LastChanged = DateTime.UtcNow };
-                _ctx?.Refresh();
             }
         }
 

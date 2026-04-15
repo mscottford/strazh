@@ -157,7 +157,7 @@ namespace Strazh.Analysis
                 foreach (var baseTypeSyntax in declaration.BaseList.Types)
                 {
                     var parentNode = sem.GetTypeInfo(baseTypeSyntax.Type).CreateTypeNode();
-                    if (node is ClassNode classNode)
+                    if (node is ClassNode classNode && parentNode != null)
                     {
                         triples.Add(new TripleOfType(classNode, parentNode));
                     }
