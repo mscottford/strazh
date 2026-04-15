@@ -41,7 +41,8 @@ namespace Strazh.Analysis
             string[] Projects,
             string? CacheDirectory = null,
             bool NoCache = false,
-            string? BuildLogDirectory = null
+            string? BuildLogDirectory = null,
+            string? Neo4jUrl = null
         );
 
         public CredentialsConfig Credentials { get; }
@@ -52,6 +53,7 @@ namespace Strazh.Analysis
         public string? CacheDirectory { get; }
         public bool NoCache { get; }
         public string? BuildLogDirectory { get; }
+        public string Neo4jUrl { get; }
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
 
@@ -74,6 +76,7 @@ namespace Strazh.Analysis
                 ? Path.Combine(strazhDataDir, "logs")
                 : options.BuildLogDirectory;
             NoCache = options.NoCache;
+            Neo4jUrl = string.IsNullOrEmpty(options.Neo4jUrl) ? "neo4j://localhost:7687" : options.Neo4jUrl;
         }
 
         private Tiers MapTier(string mode)
