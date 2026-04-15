@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -35,6 +36,100 @@ public class AnalyzerTests
 
         Assert.Contains("Strazh.Tests.ProjectA.csproj", projectFileNames);
         Assert.Contains("Strazh.Tests.ProjectB.csproj", projectFileNames);
+    }
+
+    /// <summary>
+    /// Verifies that the first run with a cache directory (cache miss, binlog written) produces
+    /// the same results as a completely uncached build.
+    /// </summary>
+    [Fact]
+    public async Task GetAnalysisContext_FirstCachedRun_YieldsSameResultsAsUncachedBuild()
+    {
+        var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-test-{Guid.NewGuid():N}");
+        try
+        {
+            var cachedContext = await Analyzer.GetAnalysisContext(
+                new AnalyzerManager(solutionPath), cacheDir);
+
+            var uncachedContext = await Analyzer.GetAnalysisContext(
+                new AnalyzerManager(solutionPath));
+
+            AssertAnalysisContextsAreEquivalent(uncachedContext, cachedContext);
+        }
+        finally
+        {
+            if (Directory.Exists(cacheDir))
+            {
+                Directory.Delete(cacheDir, recursive: true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Verifies that replaying a populated cache (cache hit, binlog replayed) produces the same
+    /// results as a completely uncached build.
+    /// </summary>
+    [Fact]
+    public async Task GetAnalysisContext_CacheHitRun_YieldsSameResultsAsUncachedBuild()
+    {
+        var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-test-{Guid.NewGuid():N}");
+        try
+        {
+            // Populate the cache
+            await Analyzer.GetAnalysisContext(new AnalyzerManager(solutionPath), cacheDir);
+
+            // Replay from cache
+            var cachedContext = await Analyzer.GetAnalysisContext(
+                new AnalyzerManager(solutionPath), cacheDir);
+
+            var uncachedContext = await Analyzer.GetAnalysisContext(
+                new AnalyzerManager(solutionPath));
+
+            AssertAnalysisContextsAreEquivalent(uncachedContext, cachedContext);
+        }
+        finally
+        {
+            if (Directory.Exists(cacheDir))
+            {
+                Directory.Delete(cacheDir, recursive: true);
+            }
+        }
+    }
+
+    private static void AssertAnalysisContextsAreEquivalent(
+        Analyzer.AnalysisContext expected, Analyzer.AnalysisContext actual)
+    {
+        var expectedResults = expected.Projects
+            .Select(p => p.Item2)
+            .OrderBy(r => r.ProjectFilePath)
+            .ToList();
+
+        var actualResults = actual.Projects
+            .Select(p => p.Item2)
+            .OrderBy(r => r.ProjectFilePath)
+            .ToList();
+
+        Assert.Equal(expectedResults.Count, actualResults.Count);
+
+        for (var i = 0; i < expectedResults.Count; i++)
+        {
+            var exp = expectedResults[i];
+            var act = actualResults[i];
+
+            Assert.Equal(exp.ProjectFilePath, act.ProjectFilePath);
+            Assert.Equal(exp.Succeeded, act.Succeeded);
+            Assert.Equal(
+                exp.ProjectReferences.OrderBy(x => x).ToList(),
+                act.ProjectReferences.OrderBy(x => x).ToList());
+            Assert.Equal(
+                exp.SourceFiles.OrderBy(x => x).ToList(),
+                act.SourceFiles.OrderBy(x => x).ToList());
+            Assert.Equal(
+                exp.PackageReferences.Keys.OrderBy(x => x).ToList(),
+                act.PackageReferences.Keys.OrderBy(x => x).ToList());
+        }
     }
 
     // [CallerFilePath] gives the compile-time absolute path of this source file.

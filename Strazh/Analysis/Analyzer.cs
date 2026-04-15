@@ -11,6 +11,8 @@ using System;
 using Strazh.Database;
 using static Strazh.Analysis.AnalyzerConfig;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Strazh.Analysis
 {
@@ -48,7 +50,7 @@ namespace Strazh.Analysis
             // Stream projects through the Build → Load pipeline and launch an Analyze + Insert
             // task for each one as soon as it becomes available, without waiting for all
             // projects to finish building and loading first.
-            await foreach (var entry in StreamProjectsAsync(manager, workspace))
+            await foreach (var entry in StreamProjectsAsync(manager, workspace, config.CacheDirectory))
             {
                 var capturedEntry = entry;
                 var capturedIndex = index++;
@@ -131,7 +133,7 @@ namespace Strazh.Analysis
         }
         
         // Based on https://github.com/phmonte/Buildalyzer/blob/9db3390b49dca033fd3f70439bab3a6327440a47/src/Buildalyzer.Workspaces/AnalyzerManagerExtensions.cs#L24-L60
-        public static async Task<AnalysisContext> GetAnalysisContext(IAnalyzerManager manager)
+        public static async Task<AnalysisContext> GetAnalysisContext(IAnalyzerManager manager, string? cacheDirectory = null)
         {
             if (manager is null)
             {
@@ -140,7 +142,7 @@ namespace Strazh.Analysis
 
             var workspace = CreateWorkspace(manager);
             var projects = new List<(Project, IAnalyzerResult)>();
-            await foreach (var item in StreamProjectsAsync(manager, workspace))
+            await foreach (var item in StreamProjectsAsync(manager, workspace, cacheDirectory))
             {
                 projects.Add(item);
             }
@@ -161,8 +163,15 @@ namespace Strazh.Analysis
         //
         // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential.
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
-            IAnalyzerManager manager, AdhocWorkspace workspace)
+            IAnalyzerManager manager, AdhocWorkspace workspace, string? cacheDirectory = null)
         {
+            HashSet<string>? projectsNeedingRebuild = null;
+            if (cacheDirectory != null)
+            {
+                Directory.CreateDirectory(cacheDirectory);
+                projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, cacheDirectory);
+            }
+
             // Build stage: run MSBuild design-time builds in parallel, capped at the number
             // of logical processors so we don't spawn an unbounded number of dotnet processes
             var buildSemaphore = new SemaphoreSlim(Environment.ProcessorCount);
@@ -172,9 +181,33 @@ namespace Strazh.Analysis
                     await buildSemaphore.WaitAsync();
                     try
                     {
-                        Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
-                        var result = p.Build().FirstOrDefault();
-                        Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                        IAnalyzerResult? result;
+                        if (cacheDirectory != null)
+                        {
+                            var binlogPath = GetBinlogCachePath(cacheDirectory, p);
+                            if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path))
+                            {
+                                Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                                p.AddBinaryLogger(binlogPath);
+                                result = p.Build().FirstOrDefault();
+                                if (result != null)
+                                {
+                                    WriteDepsFile(binlogPath, result);
+                                }
+                                Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"Build - {p.ProjectFile.Name} - cache hit");
+                                result = manager.Analyze(binlogPath).FirstOrDefault();
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Build - {p.ProjectFile.Name} - starting");
+                            result = p.Build().FirstOrDefault();
+                            Console.WriteLine($"Build - {p.ProjectFile.Name} - finished");
+                        }
                         return result;
                     }
                     finally
@@ -187,7 +220,10 @@ namespace Strazh.Analysis
             // so analysis can begin on each project without waiting for all to be loaded
             foreach (var result in results)
             {
-                if (result is null) continue;
+                if (result is null)
+                {
+                    continue;
+                }
 
                 Console.WriteLine($"Load - {Path.GetFileName(result.ProjectFilePath)} - starting");
                 var existingProject = workspace.CurrentSolution.Projects
@@ -221,6 +257,108 @@ namespace Strazh.Analysis
                 workspace.AddSolution(solutionInfo);
             }
             return workspace;
+        }
+
+        private static string GetBinlogCachePath(string cacheDirectory, IProjectAnalyzer p)
+        {
+            var bytes = MD5.HashData(Encoding.UTF8.GetBytes(p.ProjectFile.Path));
+            var hash = Convert.ToHexString(bytes)[..8];
+            return Path.Combine(cacheDirectory, $"{p.ProjectFile.Name}_{hash}.binlog");
+        }
+
+        // Returns true if no binlog exists, or if the binlog is older than any source or
+        // build file in the project directory (excluding obj/ and bin/ output folders).
+        private static bool IsBinlogStale(string binlogPath, string projectFilePath)
+        {
+            if (!File.Exists(binlogPath))
+            {
+                return true;
+            }
+
+            var binlogTime = File.GetLastWriteTimeUtc(binlogPath);
+
+            if (File.GetLastWriteTimeUtc(projectFilePath) > binlogTime)
+            {
+                return true;
+            }
+
+            var projectDir = Path.GetDirectoryName(projectFilePath)!;
+            var trackedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { ".cs", ".fs", ".vb", ".props", ".targets" };
+
+            foreach (var file in Directory.EnumerateFiles(projectDir, "*", SearchOption.AllDirectories))
+            {
+                if (file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") ||
+                    file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
+                {
+                    continue;
+                }
+
+                if (trackedExtensions.Contains(Path.GetExtension(file)) &&
+                    File.GetLastWriteTimeUtc(file) > binlogTime)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Writes the fully-evaluated project references from a build result as a sidecar next to
+        // the binlog. Subsequent runs read this instead of parsing the project file, so all
+        // MSBuild evaluation (conditions, imports, Directory.Build.props, etc.) is accounted for.
+        private static void WriteDepsFile(string binlogPath, IAnalyzerResult result) =>
+            File.WriteAllLines(binlogPath + ".deps", result.ProjectReferences);
+
+        // Reads the deps sidecar written by a previous build. Returns empty when the file does
+        // not exist (first run, or cache cleared) — the project will be stale for other reasons.
+        private static IReadOnlyList<string> ReadDepsFile(string binlogPath)
+        {
+            var depsPath = binlogPath + ".deps";
+            return File.Exists(depsPath) ? File.ReadAllLines(depsPath) : [];
+        }
+
+        // Determines which projects must be rebuilt, accounting for transitive dependencies:
+        // if project B needs a rebuild and project A references B, A is also marked for rebuild.
+        // The dependency graph is reconstructed from the sidecar files written by previous builds,
+        // so MSBuild's own evaluation (conditions, imports, etc.) is used — not our own parsing.
+        private static HashSet<string> ComputeProjectsNeedingRebuild(
+            IEnumerable<IProjectAnalyzer> projects, string cacheDirectory)
+        {
+            var projectMap = projects.ToDictionary(p => p.ProjectFile.Path, StringComparer.OrdinalIgnoreCase);
+
+            var depGraph = projectMap.ToDictionary(
+                kvp => kvp.Key,
+                kvp => ReadDepsFile(GetBinlogCachePath(cacheDirectory, kvp.Value))
+                    .Where(r => projectMap.ContainsKey(r))
+                    .ToList(),
+                StringComparer.OrdinalIgnoreCase);
+
+            var needsRebuild = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (path, analyzer) in projectMap)
+            {
+                if (IsBinlogStale(GetBinlogCachePath(cacheDirectory, analyzer), path))
+                {
+                    needsRebuild.Add(path);
+                }
+            }
+
+            // Propagate: if a referenced project needs a rebuild, so does the referencing project
+            bool changed;
+            do
+            {
+                changed = false;
+                foreach (var (path, refs) in depGraph)
+                {
+                    if (!needsRebuild.Contains(path) && refs.Any(r => needsRebuild.Contains(r)))
+                    {
+                        needsRebuild.Add(path);
+                        changed = true;
+                    }
+                }
+            } while (changed);
+
+            return needsRebuild;
         }
 
         private static async Task<IList<Triple>> AnalyzeProject(int index, (Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
