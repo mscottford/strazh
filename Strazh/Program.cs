@@ -99,7 +99,12 @@ namespace Strazh
                 }
 
                 Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
-                await Analyzer.Analyze(config, new SpectreConsoleProgress());
+                var runLogPath = Path.Combine(
+                    config.BuildLogDirectory!,
+                    $"strazh-run-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
+                using var fileProgress = new FileAnalysisProgress(runLogPath);
+                var progress = new CompositeAnalysisProgress(new SpectreConsoleProgress(), fileProgress);
+                await Analyzer.Analyze(config, progress);
                 Console.WriteLine("Code Knowledge Graph created.");
             }
             catch (Exception ex)
