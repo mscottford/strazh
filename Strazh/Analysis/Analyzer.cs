@@ -191,7 +191,11 @@ namespace Strazh.Analysis
             if (cacheDirectory != null)
             {
                 Directory.CreateDirectory(cacheDirectory);
-                projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, cacheDirectory);
+                projectsNeedingRebuild = noCache
+                    ? manager.Projects.Values
+                        .Select(p => p.ProjectFile.Path)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase)
+                    : ComputeProjectsNeedingRebuild(manager.Projects.Values, cacheDirectory);
             }
 
             // Build stage: run MSBuild design-time builds in parallel, capped at the number
