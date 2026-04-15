@@ -217,10 +217,12 @@ namespace Strazh.Analysis
                                 // successful build. The binlog is written natively by MSBuild and read
                                 // by StructuredLogger, which handles the current format regardless of
                                 // version skew.
-                                result = await TryAnalyzeBinlogAsync(manager, binlogPath);
+                                var binlogExists = File.Exists(binlogPath);
+                                result = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : null;
                                 if (result == null)
                                 {
-                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build failed");
+                                    var reason = binlogExists ? "build log could not be read" : "build failed";
+                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
                                     return null;
                                 }
                                 WriteDepsFile(binlogPath, result);
