@@ -115,7 +115,7 @@ namespace Strazh.Analysis
 
             Console.WriteLine("Building projects - starting");
             
-            List<IAnalyzerResult> results = manager.Projects.Values
+            List<IAnalyzerResult?> results = manager.Projects.Values
                 .Select(p =>
                 {
                     Console.WriteLine($"Building projects - {p.ProjectFile.Name} - starting");
@@ -142,11 +142,21 @@ namespace Strazh.Analysis
             // Add each result to the new workspace (sorted in solution order above, if we have a solution)
             foreach (IAnalyzerResult result in results)
             {
-                // Check for duplicate project files and don't add them
-                if (workspace.CurrentSolution.Projects.All(p => p.FilePath != result.ProjectFilePath))
+                var existingProject = workspace.CurrentSolution.Projects.FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
+                if (existingProject is null)
                 {
+                    // AddToWorkspace with addProjectReferences: true eagerly adds referenced projects
+                    // into the workspace. Those will be picked up via existingProject on their own
+                    // loop iteration below.
                     var project = result.AddToWorkspace(workspace, true);
                     projectResults.Add((project, result));
+                }
+                else
+                {
+                    // Already in the workspace because an earlier project pulled it in as a
+                    // transitive reference. Still include it so it gets CONTAINS triples and
+                    // is analyzed — just reuse the workspace Project object already there.
+                    projectResults.Add((existingProject, result));
                 }
             }
 

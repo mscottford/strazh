@@ -36,46 +36,26 @@ namespace Strazh.Domain
 
     // Code
 
-    public abstract class CodeNode : Node
+    public abstract class CodeNode(string fullName, string name, string[] modifiers = null) : Node(fullName, name)
     {
-        public CodeNode(string fullName, string name, string[] modifiers = null)
-            : base(fullName, name)
-        {
-
-            Modifiers = modifiers == null ? "" : string.Join(", ", modifiers);
-        }
-
-        public string Modifiers { get; }
+        public string Modifiers { get; } = modifiers == null ? "" : string.Join(", ", modifiers);
 
         public override string Set(string node)
             => $"{base.Set(node)}{(string.IsNullOrEmpty(Modifiers) ? "" : $", {node}.modifiers = \"{Modifiers}\"")}";
     }
 
-    public abstract class TypeNode : CodeNode
-    {
-        public TypeNode(string fullName, string name, string[] modifiers = null)
-            : base(fullName, name, modifiers)
-        {
-        }
-    }
+    public abstract class TypeNode(string fullName, string name, string[] modifiers = null)
+        : CodeNode(fullName, name, modifiers);
 
-    public class ClassNode : TypeNode
+    public class ClassNode(string fullName, string name, string[] modifiers = null)
+        : TypeNode(fullName, name, modifiers)
     {
-        public ClassNode(string fullName, string name, string[] modifiers = null)
-            : base(fullName, name, modifiers)
-        {
-        }
-
         public override string Label { get; } = "Class";
     }
 
-    public class InterfaceNode : TypeNode
+    public class InterfaceNode(string fullName, string name, string[] modifiers = null)
+        : TypeNode(fullName, name, modifiers)
     {
-        public InterfaceNode(string fullName, string name, string[] modifiers = null)
-            : base(fullName, name, modifiers)
-        {
-        }
-
         public override string Label { get; } = "Interface";
     }
 
@@ -106,19 +86,13 @@ namespace Strazh.Domain
 
     // Structure
 
-    public class FileNode : Node
+    public class FileNode(string fullName, string name) : Node(fullName, name)
     {
-        public FileNode(string fullName, string name)
-            : base(fullName, name) { }
-
         public override string Label { get; } = "File";
     }
 
-    public class FolderNode : Node
+    public class FolderNode(string fullName, string name) : Node(fullName, name)
     {
-        public FolderNode(string fullName, string name)
-            : base(fullName, name) { }
-
         public override string Label { get; } = "Folder";
     }
 
@@ -127,13 +101,10 @@ namespace Strazh.Domain
         public override string Label => "Solution";
     }
 
-    public class ProjectNode : Node
+    public class ProjectNode(string fullName, string name) : Node(fullName, name)
     {
         public ProjectNode(string name)
             : this(name, name) { }
-
-        public ProjectNode(string fullName, string name)
-            : base(fullName, name) { }
 
         public override string Label { get; } = "Project";
     }
