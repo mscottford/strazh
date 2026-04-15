@@ -113,7 +113,24 @@ namespace Strazh.Analysis
         {
             Interlocked.Increment(ref _completed);
             _active.TryRemove(projectFilePath, out _);
-            var markup = $"[yellow]Skipped[/] {Markup.Escape(filename)} ({Markup.Escape(reason)})";
+            string label;
+            if (reason.Contains("timed out"))
+            {
+                label = "[yellow]Timeout[/]";
+            }
+            else if (reason.Contains("could not be read"))
+            {
+                label = "[yellow]Unreadable[/]";
+            }
+            else if (reason.Contains("failed"))
+            {
+                label = "[red]Failed[/]";
+            }
+            else
+            {
+                label = "[yellow]Skipped[/]";
+            }
+            var markup = $"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})";
             _pendingWrites.Enqueue(() => AnsiConsole.MarkupLine(markup));
         }
 
