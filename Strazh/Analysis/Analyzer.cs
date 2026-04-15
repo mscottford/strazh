@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System.Linq;
@@ -36,8 +37,21 @@ namespace Strazh.Analysis
             Console.WriteLine("done.");
             
             Console.WriteLine("Analyzing workspace...");
-            
-            for (var index = 0; index < context.Projects.Count; index++)
+
+            // Delete graph data upfront before parallel analysis begins, so that no project
+            // races against the delete.
+            if (config.IsDelete)
+            {
+                await DbManager.DeleteData(config.Credentials);
+            }
+
+            // Limit concurrent Neo4j connections to avoid exhausting the connection pool.
+            var semaphore = new SemaphoreSlim(4);
+            var total = context.Projects.Count;
+
+            // Analyze and insert all projects concurrently. Task.Run ensures CPU-bound work
+            // (syntax tree walking) runs on thread-pool threads rather than the calling thread.
+            var tasks = context.Projects.Select((entry, index) => Task.Run(async () =>
             {
                 var triples = new List<Triple>();
 
@@ -45,28 +59,28 @@ namespace Strazh.Analysis
                 {
                     var solutionRoot = GetRoot(manager.SolutionFilePath);
                     var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
-                    
+
                     var solutionName = GetSolutionName(manager.SolutionFilePath);
                     var solutionNode = new SolutionNode(solutionName);
                     triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
-                    
-                    var projectNode = new ProjectNode(GetProjectName(context.Projects[index].Item1.Name));
+
+                    var projectNode = new ProjectNode(GetProjectName(entry.Item1.Name));
                     triples.Add(new TripleContains(solutionNode, projectNode));
                 }
 
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: analyze - starting");
-                var projectTriples = await AnalyzeProject(index + 1, context.Projects[index], config.Tier);
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: analyze - finished");
-                
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: analyze - starting");
+                var projectTriples = await AnalyzeProject(index + 1, entry, config.Tier);
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: analyze - finished");
+
                 triples.AddRange(projectTriples);
-                
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: grouping - starting");
+
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: grouping - starting");
                 try
                 {
                     triples = triples.GroupBy(x => x.ToString()).Select(x => x.First()).OrderBy(x => x.NodeA.Label)
                         .ToList();
                 }
-                catch (Exception error)
+                catch (Exception)
                 {
                     Console.WriteLine("Error detected. Dumping detailed logging data.");
                     Console.WriteLine("[");
@@ -88,12 +102,22 @@ namespace Strazh.Analysis
                     Console.WriteLine("]");
                     throw;
                 }
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: grouping - finished");
-                
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: inserting - starting");
-                await DbManager.InsertData(triples, config.Credentials, config.IsDelete && index == 0);
-                Console.WriteLine($"+ [{index + 1}/{context.Projects.Count} {context.Projects[index].Item1.Name}: inserting - finished");
-            }
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: grouping - finished");
+
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: inserting - starting");
+                await semaphore.WaitAsync();
+                try
+                {
+                    await DbManager.InsertData(triples, config.Credentials);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+                Console.WriteLine($"+ [{index + 1}/{total}] {entry.Item1.Name}: inserting - finished");
+            })).ToList();
+
+            await Task.WhenAll(tasks);
             context.Workspace.Dispose();
         }
 
@@ -115,7 +139,10 @@ namespace Strazh.Analysis
 
             Console.WriteLine("Building projects - starting");
             
+            // Build projects in parallel — each invocation spawns an isolated MSBuild process
+            // so there is no shared mutable state between concurrent builds.
             List<IAnalyzerResult?> results = manager.Projects.Values
+                .AsParallel()
                 .Select(p =>
                 {
                     Console.WriteLine($"Building projects - {p.ProjectFile.Name} - starting");
@@ -139,9 +166,12 @@ namespace Strazh.Analysis
                 results = [.. results.OrderBy(p => projectsInOrder.FindIndex(g => g.AbsolutePath == p.ProjectFilePath))];
             }
 
-            // Add each result to the new workspace (sorted in solution order above, if we have a solution)
+            // Add each result to the new workspace (sorted in solution order above, if we have a solution).
+            // AdhocWorkspace mutations are not thread-safe, so this loop remains sequential.
+            Console.WriteLine("Loading projects into workspace - starting");
             foreach (IAnalyzerResult result in results)
             {
+                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - starting");
                 var existingProject = workspace.CurrentSolution.Projects.FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
                 if (existingProject is null)
                 {
@@ -158,7 +188,9 @@ namespace Strazh.Analysis
                     // is analyzed — just reuse the workspace Project object already there.
                     projectResults.Add((existingProject, result));
                 }
+                Console.WriteLine($"Loading projects into workspace - {Path.GetFileName(result.ProjectFilePath)} - finished");
             }
+            Console.WriteLine("Loading projects into workspace - finished");
 
             return new AnalysisContext(workspace, projectResults.ToList());
         }

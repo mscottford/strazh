@@ -11,7 +11,20 @@ namespace Strazh.Database
     {
         private const string CONNECTION = "neo4j://localhost:7687";
 
-        public static async Task InsertData(IList<Triple> triples, CredentialsConfig credentials, bool isDelete)
+        public static async Task DeleteData(CredentialsConfig credentials)
+        {
+            if (credentials == null)
+            {
+                throw new ArgumentException($"Please, provide credentials.");
+            }
+            Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database...");
+            await using var driver = GraphDatabase.Driver(CONNECTION, AuthTokens.Basic(credentials.User, credentials.Password));
+            await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
+            await session.RunAsync("MATCH (n) DETACH DELETE n;");
+            Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database complete.");
+        }
+
+        public static async Task InsertData(IList<Triple> triples, CredentialsConfig credentials)
         {
             if (credentials == null)
             {
@@ -22,12 +35,6 @@ namespace Strazh.Database
             await using var session = driver.AsyncSession(o => o.WithDatabase(credentials.Database));
             try
             {
-                if (isDelete)
-                {
-                    Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database...");
-                    await session.RunAsync("MATCH (n) DETACH DELETE n;");
-                    Console.WriteLine($"Deleting graph data of \"{credentials.Database}\" database complete.");
-                }
                 Console.WriteLine($"Processing {triples.Count} triples...");
                 foreach (var triple in triples)
                 {
