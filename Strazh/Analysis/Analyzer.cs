@@ -180,8 +180,13 @@ namespace Strazh.Analysis
 
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
             IAnalyzerManager manager, AdhocWorkspace workspace, string? cacheDirectory = null,
-            StreamCallbacks callbacks = default)
+            StreamCallbacks callbacks = default, bool noCache = false, string? buildLogDirectory = null)
         {
+            if (buildLogDirectory != null)
+            {
+                Directory.CreateDirectory(buildLogDirectory);
+            }
+
             HashSet<string>? projectsNeedingRebuild = null;
             if (cacheDirectory != null)
             {
@@ -205,7 +210,7 @@ namespace Strazh.Analysis
                             if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path))
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(GetProjectName(p.ProjectFile.Name), binlogPath));
+                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name), binlogPath));
                                 if (timedOut)
                                 {
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build timed out");
@@ -248,7 +253,7 @@ namespace Strazh.Analysis
                         else
                         {
                             callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                            var (buildResult2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(GetProjectName(p.ProjectFile.Name)));
+                            var (buildResult2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name)));
                             result = buildResult2;
                             if (result == null)
                             {
@@ -375,7 +380,7 @@ namespace Strazh.Analysis
             return (await buildTask.ConfigureAwait(false), timedOut: false);
         }
 
-        private static EnvironmentOptions CreateBuildOptions(string projectName, string? binlogPath = null)
+        private static EnvironmentOptions CreateBuildOptions(string? buildLogDirectory, string projectName, string? binlogPath = null)
         {
             var opts = new EnvironmentOptions();
             opts.Arguments.Add("/nodeReuse:false");
@@ -385,6 +390,11 @@ namespace Strazh.Analysis
                 // BinaryLogger on the host-side pipe, which can cause deserialization errors when the
                 // SDK's MSBuild version is newer than the MsBuildPipeLogger the host uses.
                 opts.Arguments.Add($"\"/bl:{binlogPath}\"");
+            }
+            if (buildLogDirectory != null)
+            {
+                var logFile = Path.Combine(buildLogDirectory, $"{projectName}.log");
+                opts.Arguments.Add($"\"/fileLoggerParameters:LogFile={logFile};Verbosity=normal\"");
             }
             return opts;
         }
