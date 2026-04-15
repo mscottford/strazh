@@ -33,29 +33,47 @@ namespace Strazh.Analysis
             Code = 2
         }
 
+        public record Options(
+            string Credentials,
+            string Tier,
+            string Delete,
+            string Solution,
+            string[] Projects,
+            string? CacheDirectory = null,
+            bool NoCache = false,
+            string? BuildLogDirectory = null
+        );
+
         public CredentialsConfig Credentials { get; }
         public Tiers Tier { get; }
         public string Solution { get; }
         public string[] Projects { get; }
         public bool IsDelete { get; }
         public string? CacheDirectory { get; }
+        public bool NoCache { get; }
+        public string? BuildLogDirectory { get; }
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
 
         public bool IsValid => (!string.IsNullOrEmpty(Solution) && Projects.Length == 0)
             || (string.IsNullOrEmpty(Solution) && Projects.Length > 0);
 
-        public AnalyzerConfig(string credentials, string tier, string delete, string solution, string[] projects, string? cacheDirectory = null)
+        public AnalyzerConfig(Options options)
         {
-            solution = solution == "none" ? "" : solution;
-            Credentials = new CredentialsConfig(credentials);
-            Tier = MapTier(tier);
-            IsDelete = delete != "false";
+            var solution = options.Solution == "none" ? "" : options.Solution;
+            Credentials = new CredentialsConfig(options.Credentials);
+            Tier = MapTier(options.Tier);
+            IsDelete = options.Delete != "false";
             Solution = solution;
-            Projects = projects ?? new string[] { };
-            CacheDirectory = string.IsNullOrEmpty(cacheDirectory)
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "strazh", "cache")
-                : cacheDirectory;
+            Projects = options.Projects ?? new string[] { };
+            var strazhDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "strazh");
+            CacheDirectory = string.IsNullOrEmpty(options.CacheDirectory)
+                ? Path.Combine(strazhDataDir, "cache")
+                : options.CacheDirectory;
+            BuildLogDirectory = string.IsNullOrEmpty(options.BuildLogDirectory)
+                ? Path.Combine(strazhDataDir, "logs")
+                : options.BuildLogDirectory;
+            NoCache = options.NoCache;
         }
 
         private Tiers MapTier(string mode)
