@@ -19,7 +19,7 @@ namespace Strazh.Analysis
 {
     public static class Analyzer
     {
-        public static async Task Analyze(AnalyzerConfig config, IAnalysisProgress progress)
+        public static async Task Analyze(AnalyzerConfig config, IAnalysisProgress progress, ITripleStore store)
         {
             Console.WriteLine($"Setup analyzer...");
 
@@ -37,17 +37,17 @@ namespace Strazh.Analysis
             // races against the delete.
             if (config.IsDelete)
             {
-                await DbManager.DeleteData(config.Credentials, config.Neo4jUrl);
+                await store.DeleteAllAsync();
             }
 
             // Ensure uniqueness constraints (and their implicit indexes) exist for every node
             // label before any MERGE operations run. Without indexes, each MERGE does a full
             // label scan and performance degrades linearly as the database grows.
-            await DbManager.EnsureIndexes(config.Credentials, config.Neo4jUrl);
+            await store.EnsureIndexesAsync();
 
             var workspace = CreateWorkspace(manager);
 
-            // Limit concurrent Neo4j connections to one per logical processor.
+            // Limit concurrent store connections to one per logical processor.
             var semaphore = new SemaphoreSlim(Environment.ProcessorCount);
             var analysisTasks = new List<Task>();
 
@@ -76,27 +76,7 @@ namespace Strazh.Analysis
 
                         if (config.IsSolutionBased)
                         {
-                            var solutionRoot = GetRoot(manager.SolutionFilePath);
-                            var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
-
-                            var solutionName = GetSolutionName(manager.SolutionFilePath);
-                            var solutionNode = new SolutionNode(solutionName);
-                            triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
-
-                            // Connect the project's folder to the solution's root folder so the folder
-                            // hierarchy is traversable from the solution downward. Without this triple,
-                            // project folder nodes are orphans — present in the graph but unreachable
-                            // from the solution folder via INCLUDED_IN traversal.
-                            var projectRoot = capturedEntry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
-                            if (!string.IsNullOrEmpty(projectRoot) &&
-                                !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
-                            {
-                                var projectRootNode = new FolderNode(projectRoot, projectRoot);
-                                triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
-                            }
-
-                            var projectNode = new ProjectNode(GetProjectName(capturedEntry.Item1.Name));
-                            triples.Add(new TripleContains(solutionNode, projectNode));
+                            triples.AddRange(GetSolutionAndRepositoryTriples(manager, capturedEntry));
                         }
 
                         var projectTriples = await AnalyzeProject(capturedEntry, config.Tier);
@@ -118,7 +98,7 @@ namespace Strazh.Analysis
                         await semaphore.WaitAsync();
                         try
                         {
-                            await DbManager.InsertData(triples, config.Credentials, config.Neo4jUrl);
+                            await store.InsertAsync(triples);
                         }
                         finally
                         {
@@ -514,6 +494,54 @@ namespace Strazh.Analysis
             } while (changed);
 
             return needsRebuild;
+        }
+
+        // Builds all triples for a solution and its associated git repository for a
+        // single project entry. Called once per project inside the parallel analysis tasks.
+        private static IList<Triple> GetSolutionAndRepositoryTriples(
+            IAnalyzerManager manager,
+            (Project project, IAnalyzerResult result) entry)
+        {
+            var triples = new List<Triple>();
+
+            var solutionRoot = GetRoot(manager.SolutionFilePath);
+            var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
+
+            var solutionName = GetSolutionName(manager.SolutionFilePath);
+            var solutionNode = new SolutionNode(solutionName);
+            triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
+
+            // Repository: find the git root, read the remote origin URL, and emit a
+            // Folder(repoShortName) -INCLUDED_IN-> Repository(owner/repo) triple so the
+            // graph is rooted at the repository rather than an arbitrary local path.
+            var repoName = GitHelper.GetRepositoryName(manager.SolutionFilePath);
+            if (repoName != null)
+            {
+                var gitRoot = GitHelper.FindGitRoot(manager.SolutionFilePath);
+                var gitRootName = gitRoot != null
+                    ? Path.GetFileName(gitRoot)
+                    : repoName.Split('/').Last();
+                var repoRootFolderNode = new FolderNode(gitRootName, gitRootName);
+                var repoNode = new RepositoryNode(repoName);
+                triples.Add(new TripleIncludedIn(repoRootFolderNode, repoNode));
+            }
+
+            // Connect the project's folder to the solution's root folder so the folder
+            // hierarchy is traversable from the solution downward. Without this triple,
+            // project folder nodes are orphans — present in the graph but unreachable
+            // from the solution folder via INCLUDED_IN traversal.
+            var projectRoot = entry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
+            if (!string.IsNullOrEmpty(projectRoot) &&
+                !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                var projectRootNode = new FolderNode(projectRoot, projectRoot);
+                triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
+            }
+
+            var projectNode = new ProjectNode(GetProjectName(entry.Item1.Name));
+            triples.Add(new TripleContains(solutionNode, projectNode));
+
+            return triples;
         }
 
         private static async Task<IList<Triple>> AnalyzeProject((Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
