@@ -179,15 +179,18 @@ namespace Strazh.Analysis
             }
 
             // Build stage: run MSBuild design-time builds in parallel, capped at the number
-            // of logical processors so we don't spawn an unbounded number of dotnet processes
+            // of logical processors so we don't spawn an unbounded number of dotnet processes.
+            // Each project may target multiple frameworks; the build task returns all TFM results
+            // so each one can be analyzed independently. A project is considered successful if
+            // at least one TFM produces a result.
             var buildSemaphore = new SemaphoreSlim(Environment.ProcessorCount);
-            IAnalyzerResult?[] results = await Task.WhenAll(
-                manager.Projects.Values.Select(p => Task.Run<IAnalyzerResult?>(async () =>
+            IReadOnlyList<IAnalyzerResult>?[] results = await Task.WhenAll(
+                manager.Projects.Values.Select(p => Task.Run<IReadOnlyList<IAnalyzerResult>?>(async () =>
                 {
                     await buildSemaphore.WaitAsync();
                     try
                     {
-                        IAnalyzerResult? result;
+                        IReadOnlyList<IAnalyzerResult> tfmResults;
                         if (cacheDirectory != null)
                         {
                             var binlogPath = GetBinlogCachePath(cacheDirectory, p);
@@ -207,21 +210,21 @@ namespace Strazh.Analysis
                                 // by StructuredLogger, which handles the current format regardless of
                                 // version skew.
                                 var binlogExists = File.Exists(binlogPath);
-                                result = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : null;
-                                if (result == null)
+                                tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : [];
+                                if (!tfmResults.Any(r => r.Succeeded))
                                 {
                                     var reason = binlogExists ? "build log could not be read" : "build failed";
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
                                     return null;
                                 }
-                                WriteDepsFile(binlogPath, result);
+                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded));
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                             else
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true);
-                                result = manager.Analyze(binlogPath).FirstOrDefault();
-                                if (result == null)
+                                tfmResults = manager.Analyze(binlogPath).ToList();
+                                if (!tfmResults.Any(r => r.Succeeded))
                                 {
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "cached build log could not be read");
                                     return null;
@@ -230,24 +233,24 @@ namespace Strazh.Analysis
                                 // Without this, a project whose build previously timed out (leaving
                                 // the deps file from an older run) would carry stale dependency
                                 // information into the next staleness-propagation pass.
-                                WriteDepsFile(binlogPath, result);
+                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded));
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                         }
                         else
                         {
                             callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                            var (buildResult2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name)));
-                            result = buildResult2;
-                            if (result == null)
+                            var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name)));
+                            if (buildResults2 == null || !buildResults2.Any(r => r.Succeeded))
                             {
                                 var reason = timedOut2 ? "build timed out" : "build failed";
                                 callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
                                 return null;
                             }
+                            tfmResults = buildResults2;
                             callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                         }
-                        return result;
+                        return tfmResults;
                     }
                     finally
                     {
@@ -260,36 +263,44 @@ namespace Strazh.Analysis
             // Results are sorted in dependency order so every project's references are already
             // in the workspace when AddToWorkspace runs, preventing it from triggering redundant
             // MSBuild builds for references it cannot find there yet.
-            foreach (var result in TopologicalSort(results))
+            //
+            // For multi-target projects all TFMs share the same ProjectId (derived from the file
+            // path), so only the first TFM result is used to add the project to the workspace.
+            // Each TFM result is then yielded with that shared workspace project so that
+            // TFM-specific package/project references are each captured as triples.
+            foreach (var tfmGroup in TopologicalSort(results))
             {
-                if (result is null)
-                {
-                    continue;
-                }
+                var primaryResult = tfmGroup.First(r => r.Succeeded);
 
                 var existingProject = workspace.CurrentSolution.Projects
-                    .FirstOrDefault(p => p.FilePath == result.ProjectFilePath);
+                    .FirstOrDefault(p => p.FilePath == primaryResult.ProjectFilePath);
                 if (existingProject is null)
                 {
                     // AddToWorkspace with addProjectReferences: true eagerly adds referenced projects
                     // into the workspace. Those will be picked up via existingProject on their own
                     // iteration below.
-                    var project = result.AddToWorkspace(workspace, true);
+                    var project = primaryResult.AddToWorkspace(workspace, true);
                     if (project is null)
                     {
                         // AddToWorkspace returns null for project types not supported by Roslyn
                         // (e.g. F# projects, native projects). Skip them — they cannot be analyzed.
-                        callbacks.OnProjectSkipped?.Invoke(result.ProjectFilePath, Path.GetFileName(result.ProjectFilePath), "unsupported project type");
+                        callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
                         continue;
                     }
-                    yield return (project, result);
+                    foreach (var result in tfmGroup)
+                    {
+                        yield return (project, result);
+                    }
                 }
                 else
                 {
                     // Already in the workspace because an earlier project pulled it in as a
                     // transitive reference. Still include it so it gets CONTAINS triples and
                     // is analyzed — just reuse the workspace Project object already there.
-                    yield return (existingProject, result);
+                    foreach (var result in tfmGroup)
+                    {
+                        yield return (existingProject, result);
+                    }
                 }
             }
         }
@@ -300,34 +311,39 @@ namespace Strazh.Analysis
         // the workspace and calls analyzer.Build() on them — bypassing our binlog cache
         // and running full, sequential in-process MSBuild evaluations for each one.
         // A DFS post-order traversal over the dependency graph produces the correct order.
-        private static IReadOnlyList<IAnalyzerResult> TopologicalSort(IAnalyzerResult?[] results)
+        //
+        // For multi-target projects, all TFMs share the same file path and project
+        // references, so the first TFM result is used for dependency ordering and the
+        // full group is emitted together.
+        private static IReadOnlyList<IReadOnlyList<IAnalyzerResult>> TopologicalSort(IReadOnlyList<IAnalyzerResult>?[] results)
         {
             var byPath = results
                 .Where(r => r is not null)
-                .ToDictionary(r => r!.ProjectFilePath, r => r!, StringComparer.OrdinalIgnoreCase);
+                .ToDictionary(r => r!.First(x => x.Succeeded).ProjectFilePath, r => r!, StringComparer.OrdinalIgnoreCase);
 
             var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var sorted = new List<IAnalyzerResult>(byPath.Count);
+            var sorted = new List<IReadOnlyList<IAnalyzerResult>>(byPath.Count);
 
-            void Visit(IAnalyzerResult result)
+            void Visit(IReadOnlyList<IAnalyzerResult> tfmGroup)
             {
-                if (!visited.Add(result.ProjectFilePath))
+                var primaryResult = tfmGroup.First(r => r.Succeeded);
+                if (!visited.Add(primaryResult.ProjectFilePath))
                 {
                     return;
                 }
-                foreach (var refPath in result.ProjectReferences)
+                foreach (var refPath in primaryResult.ProjectReferences)
                 {
-                    if (byPath.TryGetValue(refPath, out var refResult))
+                    if (byPath.TryGetValue(refPath, out var refGroup))
                     {
-                        Visit(refResult);
+                        Visit(refGroup);
                     }
                 }
-                sorted.Add(result);
+                sorted.Add(tfmGroup);
             }
 
-            foreach (var result in byPath.Values)
+            foreach (var tfmGroup in byPath.Values)
             {
-                Visit(result);
+                Visit(tfmGroup);
             }
 
             return sorted;
@@ -343,20 +359,25 @@ namespace Strazh.Analysis
         // results. The MSBuild child process closes its stdout pipe (causing p.Build() to return)
         // before the BinaryLogger's file write is guaranteed to be fully flushed to disk. A single
         // retry covers the common case where the OS buffers have not yet been committed.
-        private static async Task<IAnalyzerResult?> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
+        // Returns all TFM results from the binlog (one per target framework for multi-target projects).
+        private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
         {
-            var result = manager.Analyze(binlogPath).FirstOrDefault();
-            if (result is not null)
+            var results = manager.Analyze(binlogPath).ToList();
+            if (results.Count > 0)
             {
-                return result;
+                return results;
             }
             await Task.Delay(500).ConfigureAwait(false);
-            return manager.Analyze(binlogPath).FirstOrDefault();
+            return manager.Analyze(binlogPath).ToList();
         }
 
-        private static async Task<(IAnalyzerResult? result, bool timedOut)> BuildWithTimeoutAsync(IProjectAnalyzer p, EnvironmentOptions opts)
+        private static async Task<(IReadOnlyList<IAnalyzerResult>? results, bool timedOut)> BuildWithTimeoutAsync(IProjectAnalyzer p, EnvironmentOptions opts)
         {
-            var buildTask = Task.Run(() => p.Build(opts).FirstOrDefault());
+            var buildTask = Task.Run<IReadOnlyList<IAnalyzerResult>?>(() =>
+            {
+                var results = p.Build(opts).ToList();
+                return results.Count > 0 ? results : null;
+            });
             if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
             {
                 return (null, timedOut: true);
