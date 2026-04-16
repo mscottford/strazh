@@ -68,7 +68,20 @@ namespace Strazh.Analysis
             IsDelete = options.Delete != "false";
             Solution = solution;
             Projects = options.Projects ?? new string[] { };
-            var strazhDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "strazh");
+            // SpecialFolder.ApplicationData returns empty string on Linux when $HOME is unset
+            // (e.g. inside certain Docker images). Fall back through UserProfile and $HOME to
+            // the system temp directory so the cache path is always absolute and usable.
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(appData))
+            {
+                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (string.IsNullOrEmpty(home))
+                {
+                    home = Environment.GetEnvironmentVariable("HOME") ?? Path.GetTempPath();
+                }
+                appData = Path.Combine(home, ".config");
+            }
+            var strazhDataDir = Path.Combine(appData, "strazh");
             CacheDirectory = string.IsNullOrEmpty(options.CacheDirectory)
                 ? Path.Combine(strazhDataDir, "cache")
                 : options.CacheDirectory;
