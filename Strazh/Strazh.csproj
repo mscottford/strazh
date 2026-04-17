@@ -8,17 +8,16 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Buildalyzer" Version="8.0.0" />
-    <PackageReference Include="Buildalyzer.Workspaces" Version="8.0.0" />
-    <!-- Override the version of MSBuild.StructuredLogger that Buildalyzer 8.0.0 pulls in
-         (2.2.158). The .NET 10 SDK writes binlogs in a format that requires 2.3.x+ to parse;
-         without this override every binlog read returns empty results on .NET 10 hosts. -->
-    <PackageReference Include="MSBuild.StructuredLogger" Version="2.3.154" />
+    <PackageReference Include="MScottFord.Forks.Buildalyzer" Version="9.0.0-alpha" />
+    <PackageReference Include="MScottFord.Forks.Buildalyzer.Workspaces" Version="9.0.0-alpha" />
     <PackageReference Include="Microsoft.CodeAnalysis" Version="5.3.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.Csharp" Version="5.3.0" />
+    <!-- Pin patched version to suppress NU1903 vulnerability warnings (GHSA-37gx-xxp4-5rgx, GHSA-w3x6-4m5h-cxqf).
+         System.Security.Cryptography.Xml 10.0.1 is pulled in transitively on net10.0 targets. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.6" />
     <PackageReference Include="Neo4j.Driver" Version="6.0.0" />
-    <PackageReference Include="Spectre.Console" Version="0.55.0" />
-    <PackageReference Include="System.CommandLine" Version="2.0.5" />
+    <PackageReference Include="Spectre.Console" Version="0.55.2" />
+    <PackageReference Include="System.CommandLine" Version="2.0.6" />
   </ItemGroup>
 
 </Project>
