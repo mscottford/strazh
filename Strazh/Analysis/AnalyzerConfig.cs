@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 
 namespace Strazh.Analysis
 {
@@ -66,8 +67,10 @@ namespace Strazh.Analysis
             Credentials = new CredentialsConfig(options.Credentials);
             Tier = MapTier(options.Tier);
             IsDelete = options.Delete != "false";
-            Solution = solution;
-            Projects = options.Projects ?? new string[] { };
+            Solution = string.IsNullOrEmpty(solution) ? solution : Path.GetFullPath(solution);
+            Projects = (options.Projects ?? Array.Empty<string>())
+                .Select(Path.GetFullPath)
+                .ToArray();
             // SpecialFolder.ApplicationData returns empty string on Linux when $HOME is unset
             // (e.g. inside certain Docker images). Fall back through UserProfile and $HOME to
             // the system temp directory so the cache path is always absolute and usable.

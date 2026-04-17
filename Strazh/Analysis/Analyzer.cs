@@ -9,6 +9,7 @@ using Buildalyzer.Environment;
 using Buildalyzer.Workspaces;
 using System.Collections.Generic;
 using System;
+using System.Collections.Immutable;
 using Strazh.Database;
 using static Strazh.Analysis.AnalyzerConfig;
 using System.IO;
@@ -23,9 +24,13 @@ namespace Strazh.Analysis
         {
             Console.WriteLine($"Setup analyzer...");
 
+            Directory.CreateDirectory(config.BuildLogDirectory);
+            var buildalyzerLogPath = Path.Combine(config.BuildLogDirectory, $"buildalyzer-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
+            using var buildalyzerLog = TextWriter.Synchronized(new StreamWriter(buildalyzerLogPath, append: false));
+            var managerOptions = new AnalyzerManagerOptions { LogWriter = buildalyzerLog };
             var manager = config.IsSolutionBased
-                ? new AnalyzerManager(config.Solution)
-                : new AnalyzerManager();
+                ? new AnalyzerManager(config.Solution, managerOptions)
+                : new AnalyzerManager(managerOptions);
 
             var projectAnalyzers = (config.IsSolutionBased
                 ? manager.Projects.Values
@@ -194,10 +199,10 @@ namespace Strazh.Analysis
                         if (cacheDirectory != null)
                         {
                             var binlogPath = GetBinlogCachePath(cacheDirectory, p);
-                            if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path))
+                            if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path) || !File.Exists(binlogPath))
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name), binlogPath));
+                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path, binlogPath));
                                 if (timedOut)
                                 {
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build timed out");
@@ -217,30 +222,33 @@ namespace Strazh.Analysis
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
                                     return null;
                                 }
-                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded));
+                                // Write an initial deps sidecar with whatever project references
+                                // MSBuild returned. Binlog replay often leaves this empty (MSBuild
+                                // 17.14+ does not emit ProjectReferences into the replay). The Load
+                                // stage patches from the Roslyn workspace and overwrites the file
+                                // with the correct paths so subsequent staleness checks are accurate.
+                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded).ProjectReferences.ToList());
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                             else
                             {
                                 callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true);
-                                tfmResults = manager.Analyze(binlogPath).ToList();
+                                tfmResults = RealTfmResults(manager.Analyze(binlogPath));
                                 if (!tfmResults.Any(r => r.Succeeded))
                                 {
                                     callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "cached build log could not be read");
                                     return null;
                                 }
-                                // Keep the sidecar in sync with the binlog even on a cache hit.
-                                // Without this, a project whose build previously timed out (leaving
-                                // the deps file from an older run) would carry stale dependency
-                                // information into the next staleness-propagation pass.
-                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded));
+                                // Project references are patched from the Roslyn workspace in the
+                                // Load stage, which also overwrites the deps sidecar. Nothing to
+                                // do here beyond signalling completion.
                                 callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                             }
                         }
                         else
                         {
                             callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false);
-                            var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, GetProjectName(p.ProjectFile.Name)));
+                            var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path));
                             if (buildResults2 == null || !buildResults2.Any(r => r.Succeeded))
                             {
                                 var reason = timedOut2 ? "build timed out" : "build failed";
@@ -268,6 +276,18 @@ namespace Strazh.Analysis
             // path), so only the first TFM result is used to add the project to the workspace.
             // Each TFM result is then yielded with that shared workspace project so that
             // TFM-specific package/project references are each captured as triples.
+            //
+            // After AddToWorkspace, the Roslyn Project object carries the authoritative project
+            // references (resolved by MSBuild and stored in the workspace). We patch any
+            // IAnalyzerResult whose ProjectReferences is empty (e.g. from binlog replay) with
+            // these paths, then overwrite the deps sidecar so subsequent staleness checks work.
+            var binlogPathMap = cacheDirectory != null
+                ? manager.Projects.Values.ToDictionary(
+                    p => p.ProjectFile.Path,
+                    p => GetBinlogCachePath(cacheDirectory, p),
+                    StringComparer.OrdinalIgnoreCase)
+                : null;
+
             foreach (var tfmGroup in TopologicalSort(results))
             {
                 var primaryResult = tfmGroup.First(r => r.Succeeded);
@@ -287,7 +307,12 @@ namespace Strazh.Analysis
                         callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
                         continue;
                     }
-                    foreach (var result in tfmGroup)
+                    var patchedGroup = PatchProjectRefsFromWorkspace(tfmGroup, project, workspace);
+                    if (binlogPathMap != null && binlogPathMap.TryGetValue(primaryResult.ProjectFilePath, out var bp))
+                    {
+                        WriteDepsFile(bp, patchedGroup.First(r => r.Succeeded).ProjectReferences.ToList());
+                    }
+                    foreach (var result in patchedGroup)
                     {
                         yield return (project, result);
                     }
@@ -297,7 +322,12 @@ namespace Strazh.Analysis
                     // Already in the workspace because an earlier project pulled it in as a
                     // transitive reference. Still include it so it gets CONTAINS triples and
                     // is analyzed — just reuse the workspace Project object already there.
-                    foreach (var result in tfmGroup)
+                    var patchedGroup = PatchProjectRefsFromWorkspace(tfmGroup, existingProject, workspace);
+                    if (binlogPathMap != null && binlogPathMap.TryGetValue(primaryResult.ProjectFilePath, out var bp))
+                    {
+                        WriteDepsFile(bp, patchedGroup.First(r => r.Succeeded).ProjectReferences.ToList());
+                    }
+                    foreach (var result in patchedGroup)
                     {
                         yield return (existingProject, result);
                     }
@@ -362,20 +392,20 @@ namespace Strazh.Analysis
         // Returns all TFM results from the binlog (one per target framework for multi-target projects).
         private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
         {
-            var results = manager.Analyze(binlogPath).ToList();
+            var results = RealTfmResults(manager.Analyze(binlogPath));
             if (results.Count > 0)
             {
                 return results;
             }
             await Task.Delay(500).ConfigureAwait(false);
-            return manager.Analyze(binlogPath).ToList();
+            return RealTfmResults(manager.Analyze(binlogPath));
         }
 
         private static async Task<(IReadOnlyList<IAnalyzerResult>? results, bool timedOut)> BuildWithTimeoutAsync(IProjectAnalyzer p, EnvironmentOptions opts)
         {
             var buildTask = Task.Run<IReadOnlyList<IAnalyzerResult>?>(() =>
             {
-                var results = p.Build(opts).ToList();
+                var results = RealTfmResults(p.Build(opts));
                 return results.Count > 0 ? results : null;
             });
             if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
@@ -385,7 +415,29 @@ namespace Strazh.Analysis
             return (await buildTask.ConfigureAwait(false), timedOut: false);
         }
 
-        private static EnvironmentOptions CreateBuildOptions(string? buildLogDirectory, string projectName, string? binlogPath = null)
+        // Filters out entries that don't correspond to a real target-framework build.
+        //
+        // When building via p.Build(), MSBuild emits an outer evaluation result (TargetFramework="")
+        // plus one inner result per TFM (TargetFramework="netstandard2.1", etc.). For single-TFM
+        // projects the outer result also has Succeeded=true, so filtering by Succeeded alone
+        // returns two results per project instead of one.
+        //
+        // When replaying a binlog via manager.Analyze(), the TargetFramework property is not
+        // populated even for real TFM builds (it comes from an MSBuild property that isn't
+        // captured in the replay), so filtering by non-empty TargetFramework removes everything.
+        //
+        // Solution: prefer results with non-empty TargetFramework (inner TFM builds from p.Build()),
+        // and fall back to all Succeeded results only when none have a non-empty TargetFramework
+        // (the binlog-replay case). The Succeeded filter also handles multi-target projects where
+        // some TFMs fail and others succeed.
+        private static IReadOnlyList<IAnalyzerResult> RealTfmResults(IEnumerable<IAnalyzerResult> results)
+        {
+            var succeeded = results.Where(r => r.Succeeded).ToList();
+            var innerTfm = succeeded.Where(r => !string.IsNullOrEmpty(r.TargetFramework)).ToList();
+            return innerTfm.Count > 0 ? innerTfm : succeeded;
+        }
+
+        private static EnvironmentOptions CreateBuildOptions(string? buildLogDirectory, string projectFilePath, string? binlogPath = null)
         {
             var opts = new EnvironmentOptions();
             opts.Arguments.Add("/nodeReuse:false");
@@ -398,8 +450,11 @@ namespace Strazh.Analysis
             }
             if (buildLogDirectory != null)
             {
-                var logFile = Path.Combine(buildLogDirectory, $"{projectName}.log");
-                opts.Arguments.Add($"\"/fileLoggerParameters:LogFile={logFile};Verbosity=normal\"");
+                var displayName = GetProjectName(Path.GetFileName(projectFilePath));
+                var bytes = MD5.HashData(Encoding.UTF8.GetBytes(projectFilePath));
+                var hash = Convert.ToHexString(bytes)[..8];
+                var logFile = Path.Combine(buildLogDirectory, $"{displayName}_{hash}.log");
+                opts.Arguments.Add($"\"/fileLoggerParameters:LogFile={logFile};Verbosity=normal;Append\"");
             }
             return opts;
         }
@@ -409,7 +464,7 @@ namespace Strazh.Analysis
             var workspace = new AdhocWorkspace();
             if (!string.IsNullOrEmpty(manager.SolutionFilePath))
             {
-                SolutionInfo solutionInfo = SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, manager.SolutionFilePath);
+                Microsoft.CodeAnalysis.SolutionInfo solutionInfo = Microsoft.CodeAnalysis.SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, manager.SolutionFilePath);
                 workspace.AddSolution(solutionInfo);
             }
             return workspace;
@@ -460,11 +515,11 @@ namespace Strazh.Analysis
             return false;
         }
 
-        // Writes the fully-evaluated project references from a build result as a sidecar next to
-        // the binlog. Subsequent runs read this instead of parsing the project file, so all
-        // MSBuild evaluation (conditions, imports, Directory.Build.props, etc.) is accounted for.
-        private static void WriteDepsFile(string binlogPath, IAnalyzerResult result) =>
-            File.WriteAllLines(binlogPath + ".deps", result.ProjectReferences);
+        // Writes the project references as a sidecar next to the binlog. The list comes from
+        // either the build result (preferred: fully MSBuild-evaluated) or a project-file parse
+        // fallback. Subsequent runs read this instead of re-evaluating the project file.
+        private static void WriteDepsFile(string binlogPath, IReadOnlyList<string> projectReferences) =>
+            File.WriteAllLines(binlogPath + ".deps", projectReferences);
 
         // Reads the deps sidecar written by a previous build. Returns empty when the file does
         // not exist (first run, or cache cleared) — the project will be stale for other reasons.
@@ -613,5 +668,54 @@ namespace Strazh.Analysis
 
         private static string GetRoot(string filePath)
             => filePath.Split(Path.DirectorySeparatorChar).Reverse().Skip(1).FirstOrDefault();
+
+        // If any result in the group already has project references, the group is returned
+        // unchanged. Otherwise, Roslyn's project reference graph (populated by AddToWorkspace)
+        // is used to derive the absolute .csproj paths and wrap each result so that graph
+        // triples and topological sort are correct on cached runs.
+        private static IReadOnlyList<IAnalyzerResult> PatchProjectRefsFromWorkspace(
+            IReadOnlyList<IAnalyzerResult> tfmGroup, Project roslynProject, AdhocWorkspace workspace)
+        {
+            if (tfmGroup.Any(r => r.ProjectReferences.Any()))
+                return tfmGroup;
+            var refPaths = roslynProject.ProjectReferences
+                .Select(pr => workspace.CurrentSolution.GetProject(pr.ProjectId)?.FilePath)
+                .OfType<string>()
+                .ToList();
+            if (refPaths.Count == 0)
+                return tfmGroup;
+            return tfmGroup
+                .Select(r => (IAnalyzerResult)new AnalyzerResultWithProjectRefs(r, refPaths))
+                .ToList();
+        }
+
+        // Wraps an IAnalyzerResult and overrides ProjectReferences with a caller-supplied list.
+        // Used to attach workspace-derived project reference paths to binlog results, which do
+        // not populate ProjectReferences during replay (MSBuild 17.14+ / .NET 10 SDK).
+        private sealed class AnalyzerResultWithProjectRefs(IAnalyzerResult inner, IReadOnlyList<string> projectReferences) : IAnalyzerResult
+        {
+            public IEnumerable<string> ProjectReferences => projectReferences;
+
+            // All other members delegate to the wrapped result.
+            public ProjectAnalyzer? Analyzer => inner.Analyzer;
+            public IReadOnlyDictionary<string, IProjectItem[]> Items => inner.Items;
+            public AnalyzerManager Manager => inner.Manager;
+            public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> PackageReferences => inner.PackageReferences;
+            public string ProjectFilePath => inner.ProjectFilePath;
+            public Guid ProjectGuid => inner.ProjectGuid;
+            public IReadOnlyDictionary<string, string> Properties => inner.Properties;
+            public string[] References => inner.References;
+            public ImmutableDictionary<string, ImmutableArray<string>> ReferenceAliases => inner.ReferenceAliases;
+            public string[] AnalyzerReferences => inner.AnalyzerReferences;
+            public string[] SourceFiles => inner.SourceFiles;
+            public bool Succeeded => inner.Succeeded;
+            public string TargetFramework => inner.TargetFramework;
+            public string[] PreprocessorSymbols => inner.PreprocessorSymbols;
+            public string[] AdditionalFiles => inner.AdditionalFiles;
+            public string Command => inner.Command;
+            public string CompilerFilePath => inner.CompilerFilePath;
+            public string[] CompilerArguments => inner.CompilerArguments;
+            public string? GetProperty(string name) => inner.GetProperty(name);
+        }
     }
 }
