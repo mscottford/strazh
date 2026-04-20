@@ -347,20 +347,41 @@ namespace Strazh.Analysis
                     await buildSemaphore.WaitAsync();
                     try
                     {
-                        IReadOnlyList<IAnalyzerResult> tfmResults;
+                        var projectPath = p.ProjectFile.Path;
+                        var projectName = GetProjectName(p.ProjectFile.Name);
+                        var projectFileName = Path.GetFileName(projectPath);
+
                         if (cacheDirectory != null)
                         {
                             var binlogPath = GetBinlogCachePath(cacheDirectory, p);
-                            if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path) || !File.Exists(binlogPath))
+
+                            // Cache-hit: replay the existing binlog; fall through to fresh build on failure.
+                            if (!projectsNeedingRebuild!.Contains(projectPath) && File.Exists(binlogPath))
                             {
-                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false, buildLabel);
-                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path, binlogPath));
+                                callbacks.OnBuildStarted?.Invoke(projectPath, projectName, true, buildLabel);
+                                var cached = RealTfmResults(manager.Analyze(binlogPath));
+                                if (cached.Any(r => r.Succeeded))
+                                {
+                                    // Project references are patched from the Roslyn workspace in the
+                                    // Load stage, which also overwrites the deps sidecar. Nothing to
+                                    // do here beyond signalling completion.
+                                    callbacks.OnBuildCompleted?.Invoke(projectPath);
+                                    return cached;
+                                }
+                                // Stale or corrupted cached binlog — fall through to a fresh build.
+                            }
+
+                            // Fresh-build retry loop (max MaxBuildAttempts attempts).
+                            for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
+                            {
+                                callbacks.OnBuildStarted?.Invoke(projectPath, projectName, false, buildLabel);
+                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, projectPath, binlogPath));
                                 if (timedOut)
                                 {
                                     if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
+                                        callbacks.OnBuildCompleted?.Invoke(projectPath);
                                     else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build timed out");
+                                        callbacks.OnProjectSkipped?.Invoke(projectPath, projectFileName, "build timed out");
                                     return null;
                                 }
                                 // Read from the binlog rather than the pipe result. The pipe uses
@@ -370,60 +391,66 @@ namespace Strazh.Analysis
                                 // by StructuredLogger, which handles the current format regardless of
                                 // version skew.
                                 var binlogExists = File.Exists(binlogPath);
-                                tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : [];
-                                if (!tfmResults.Any(r => r.Succeeded))
+                                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : [];
+                                if (tfmResults.Any(r => r.Succeeded))
                                 {
-                                    var reason = binlogExists ? "build log could not be read" : "build failed";
-                                    if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                    else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
-                                    return null;
+                                    // Write an initial deps sidecar with whatever project references
+                                    // MSBuild returned. Binlog replay often leaves this empty (MSBuild
+                                    // 17.14+ does not emit ProjectReferences into the replay). The Load
+                                    // stage patches from the Roslyn workspace and overwrites the file
+                                    // with the correct paths so subsequent staleness checks are accurate.
+                                    WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded).ProjectReferences.ToList());
+                                    callbacks.OnBuildCompleted?.Invoke(projectPath);
+                                    return tfmResults;
                                 }
-                                // Write an initial deps sidecar with whatever project references
-                                // MSBuild returned. Binlog replay often leaves this empty (MSBuild
-                                // 17.14+ does not emit ProjectReferences into the replay). The Load
-                                // stage patches from the Roslyn workspace and overwrites the file
-                                // with the correct paths so subsequent staleness checks are accurate.
-                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded).ProjectReferences.ToList());
-                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                            }
-                            else
-                            {
-                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true, buildLabel);
-                                tfmResults = RealTfmResults(manager.Analyze(binlogPath));
-                                if (!tfmResults.Any(r => r.Succeeded))
+                                if (attempt < MaxBuildAttempts)
                                 {
-                                    var reason = "cached build log could not be read";
-                                    if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                    else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
-                                    return null;
+                                    if (binlogExists)
+                                    {
+                                        File.Delete(binlogPath);
+                                    }
+                                    continue;
                                 }
-                                // Project references are patched from the Roslyn workspace in the
-                                // Load stage, which also overwrites the deps sidecar. Nothing to
-                                // do here beyond signalling completion.
-                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
+                                var reason = binlogExists ? "build log could not be read" : "build failed";
+                                if (isScanPass)
+                                    callbacks.OnBuildCompleted?.Invoke(projectPath);
+                                else
+                                    callbacks.OnProjectSkipped?.Invoke(projectPath, projectFileName, reason);
+                                return null;
                             }
                         }
                         else
                         {
-                            callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false, buildLabel);
-                            var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path));
-                            if (buildResults2 == null || !buildResults2.Any(r => r.Succeeded))
+                            // No cache — retry loop against pipe results.
+                            for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
                             {
-                                var reason = timedOut2 ? "build timed out" : "build failed";
+                                callbacks.OnBuildStarted?.Invoke(projectPath, projectName, false, buildLabel);
+                                var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, projectPath));
+                                if (timedOut2)
+                                {
+                                    if (isScanPass)
+                                        callbacks.OnBuildCompleted?.Invoke(projectPath);
+                                    else
+                                        callbacks.OnProjectSkipped?.Invoke(projectPath, projectFileName, "build timed out");
+                                    return null;
+                                }
+                                if (buildResults2 != null && buildResults2.Any(r => r.Succeeded))
+                                {
+                                    callbacks.OnBuildCompleted?.Invoke(projectPath);
+                                    return buildResults2;
+                                }
+                                if (attempt < MaxBuildAttempts)
+                                {
+                                    continue;
+                                }
                                 if (isScanPass)
-                                    callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
+                                    callbacks.OnBuildCompleted?.Invoke(projectPath);
                                 else
-                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
+                                    callbacks.OnProjectSkipped?.Invoke(projectPath, projectFileName, "build failed");
                                 return null;
                             }
-                            tfmResults = buildResults2;
-                            callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
                         }
-                        return tfmResults;
+                        return null; // unreachable — loops always return
                     }
                     finally
                     {
@@ -437,6 +464,7 @@ namespace Strazh.Analysis
         // Task.Run continues to hold its thread until the process eventually exits or is reaped
         // when the parent process terminates — that is acceptable.
         private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(5);
+        private const int MaxBuildAttempts = 3;
 
         // Reads the binlog, retrying once after a short delay if the first attempt yields no
         // results. The MSBuild child process closes its stdout pipe (causing p.Build() to return)
