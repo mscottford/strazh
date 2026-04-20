@@ -16,7 +16,7 @@ public class NullAnalysisProgress : IAnalysisProgress
 
     public Task WrapAsync(int totalProjects, Func<Task> action) => action();
 
-    public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit) { }
+    public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel = "Building") { }
     public void OnBuildCompleted(string projectFilePath) { }
     public void OnStageChanged(string projectFilePath, string projectName, string stage) { }
     public void OnProjectCompleted(string projectFilePath, int tripleCount) { }

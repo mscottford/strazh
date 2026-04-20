@@ -35,11 +35,11 @@ namespace Strazh.Analysis
             return current();
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit)
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel = "Building")
         {
             foreach (var impl in _implementations)
             {
-                impl.OnBuildStarted(projectFilePath, projectName, isCacheHit);
+                impl.OnBuildStarted(projectFilePath, projectName, isCacheHit, buildLabel);
             }
         }
 
