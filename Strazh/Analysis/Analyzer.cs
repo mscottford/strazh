@@ -61,13 +61,17 @@ namespace Strazh.Analysis
             // projects to finish building and loading first.
             await progress.WrapAsync(projectAnalyzers.Count, async () =>
             {
-                await foreach (var entry in StreamProjectsAsync(manager, workspace, config.CacheDirectory,
-                    new StreamCallbacks
-                    {
-                        OnBuildStarted = (path, name, isCacheHit, buildLabel) => progress.OnBuildStarted(path, name, isCacheHit, buildLabel),
-                        OnBuildCompleted = path => progress.OnBuildCompleted(path),
-                        OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason)
-                    }, config.NoCache, config.BuildLogDirectory))
+                await foreach (var entry in StreamProjectsAsync(manager, workspace,
+                    new AnalysisOptions(
+                        new StreamCallbacks
+                        {
+                            OnBuildStarted = (path, name, isCacheHit, buildLabel) => progress.OnBuildStarted(path, name, isCacheHit, buildLabel),
+                            OnBuildCompleted = path => progress.OnBuildCompleted(path),
+                            OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason)
+                        },
+                        config.CacheDirectory,
+                        config.NoCache,
+                        config.BuildLogDirectory)))
                 {
                     var capturedEntry = entry;
                     var projectPath = capturedEntry.Item2.ProjectFilePath;
@@ -136,7 +140,8 @@ namespace Strazh.Analysis
 
             var workspace = CreateWorkspace(manager);
             var projects = new List<(Project, IAnalyzerResult)>();
-            await foreach (var item in StreamProjectsAsync(manager, workspace, cacheDirectory))
+            await foreach (var item in StreamProjectsAsync(manager, workspace,
+                new AnalysisOptions(Callbacks: default, cacheDirectory, NoCache: false, BuildLogDirectory: null)))
             {
                 projects.Add(item);
             }
@@ -163,24 +168,50 @@ namespace Strazh.Analysis
             public Action<string, string, string>? OnProjectSkipped { get; init; }
         }
 
+        private readonly record struct AnalysisOptions(
+            StreamCallbacks Callbacks,
+            string? CacheDirectory,
+            bool NoCache,
+            string? BuildLogDirectory);
+
+        private readonly record struct CacheContext(
+            string Directory,
+            HashSet<string> ProjectsNeedingRebuild);
+
+        // Carries the full context for one build stage (Scanning or Building).
+        private readonly record struct BuildStageContext(
+            IAnalyzerManager Manager,
+            CacheContext? Cache,
+            StreamCallbacks Callbacks,
+            string BuildLabel,
+            bool IsScanPass,
+            string? BuildLogDirectory);
+
+        private readonly record struct ProjectIdentity(string Path, string Name, string FileName);
+
+        // Bundles the three values needed to build and track one project within a stage.
+        private readonly record struct ProjectBuildState(
+            IProjectAnalyzer Project,
+            ProjectIdentity Identity,
+            string BinlogPath);
+
         private static async IAsyncEnumerable<(Project, IAnalyzerResult)> StreamProjectsAsync(
-            IAnalyzerManager manager, AdhocWorkspace workspace, string? cacheDirectory = null,
-            StreamCallbacks callbacks = default, bool noCache = false, string? buildLogDirectory = null)
+            IAnalyzerManager manager, AdhocWorkspace workspace, AnalysisOptions options = default)
         {
-            if (buildLogDirectory != null)
+            if (options.BuildLogDirectory != null)
             {
-                Directory.CreateDirectory(buildLogDirectory);
+                Directory.CreateDirectory(options.BuildLogDirectory);
             }
 
             HashSet<string>? projectsNeedingRebuild = null;
-            if (cacheDirectory != null)
+            if (options.CacheDirectory != null)
             {
-                Directory.CreateDirectory(cacheDirectory);
-                projectsNeedingRebuild = noCache
+                Directory.CreateDirectory(options.CacheDirectory);
+                projectsNeedingRebuild = options.NoCache
                     ? manager.Projects.Values
                         .Select(p => p.ProjectFile.Path)
                         .ToHashSet(StringComparer.OrdinalIgnoreCase)
-                    : ComputeProjectsNeedingRebuild(manager.Projects.Values, cacheDirectory);
+                    : ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
             }
 
             // Scan pass: if any project is missing a .deps sidecar the dependency graph is
@@ -189,14 +220,15 @@ namespace Strazh.Analysis
             // Build everything in parallel first (Scanning) to populate binlog cache and
             // .deps files, then re-derive the rebuild set from the now-complete graph before
             // the main build pass. On warm-cache runs all .deps files exist and this is skipped.
-            if (cacheDirectory != null && manager.Projects.Values.Any(
-                    p => !File.Exists(GetBinlogCachePath(cacheDirectory, p) + ".deps")))
+            if (options.CacheDirectory != null && manager.Projects.Values.Any(
+                    p => !File.Exists(GetBinlogCachePath(options.CacheDirectory, p) + ".deps")))
             {
-                await RunBuildStageAsync(manager, cacheDirectory, projectsNeedingRebuild,
-                    callbacks, "Scanning", isScanPass: true, buildLogDirectory);
+                await RunBuildStageAsync(new BuildStageContext(
+                    manager, new CacheContext(options.CacheDirectory, projectsNeedingRebuild!),
+                    options.Callbacks, BuildLabel: "Scanning", IsScanPass: true, options.BuildLogDirectory));
                 // Re-derive the rebuild set without the noCache override — the scan pass
                 // just built everything fresh, so nothing should be considered stale.
-                projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, cacheDirectory);
+                projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
             }
 
             // Main build pass: run MSBuild design-time builds in parallel, capped at the
@@ -205,9 +237,11 @@ namespace Strazh.Analysis
             // A project is considered successful if at least one TFM produces a result.
             // After a scan pass this is mostly cache replays (fast); on warm-cache runs it
             // rebuilds only the stale subset.
-            IReadOnlyList<IAnalyzerResult>?[] results = await RunBuildStageAsync(
-                manager, cacheDirectory, projectsNeedingRebuild,
-                callbacks, "Building", isScanPass: false, buildLogDirectory);
+            CacheContext? mainCache = options.CacheDirectory != null
+                ? new CacheContext(options.CacheDirectory, projectsNeedingRebuild!)
+                : null;
+            IReadOnlyList<IAnalyzerResult>?[] results = await RunBuildStageAsync(new BuildStageContext(
+                manager, mainCache, options.Callbacks, BuildLabel: "Building", IsScanPass: false, options.BuildLogDirectory));
 
             // Load stage: add each completed result to the workspace and yield immediately,
             // so analysis can begin on each project without waiting for all to be loaded.
@@ -224,10 +258,10 @@ namespace Strazh.Analysis
             // references (resolved by MSBuild and stored in the workspace). We patch any
             // IAnalyzerResult whose ProjectReferences is empty (e.g. from binlog replay) with
             // these paths, then overwrite the deps sidecar so subsequent staleness checks work.
-            var binlogPathMap = cacheDirectory != null
+            var binlogPathMap = options.CacheDirectory != null
                 ? manager.Projects.Values.ToDictionary(
                     p => p.ProjectFile.Path,
-                    p => GetBinlogCachePath(cacheDirectory, p),
+                    p => GetBinlogCachePath(options.CacheDirectory, p),
                     StringComparer.OrdinalIgnoreCase)
                 : null;
 
@@ -247,7 +281,7 @@ namespace Strazh.Analysis
                     {
                         // AddToWorkspace returns null for project types not supported by Roslyn
                         // (e.g. F# projects, native projects). Skip them — they cannot be analyzed.
-                        callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
+                        options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
                         continue;
                     }
                     var patchedGroup = PatchProjectRefsFromWorkspace(tfmGroup, project, workspace);
@@ -331,99 +365,16 @@ namespace Strazh.Analysis
         // isScanPass suppresses OnProjectSkipped for failures: scan failures are pre-work
         // noise that will be reported properly by the main pass. OnBuildCompleted is called
         // instead so the active-display entry is cleared.
-        private static Task<IReadOnlyList<IAnalyzerResult>?[]> RunBuildStageAsync(
-            IAnalyzerManager manager,
-            string? cacheDirectory,
-            HashSet<string>? projectsNeedingRebuild,
-            StreamCallbacks callbacks,
-            string buildLabel,
-            bool isScanPass,
-            string? buildLogDirectory)
+        private static Task<IReadOnlyList<IAnalyzerResult>?[]> RunBuildStageAsync(BuildStageContext stage)
         {
             var buildSemaphore = new SemaphoreSlim(Environment.ProcessorCount);
             return Task.WhenAll(
-                manager.Projects.Values.Select(p => Task.Run<IReadOnlyList<IAnalyzerResult>?>(async () =>
+                stage.Manager.Projects.Values.Select(project => Task.Run<IReadOnlyList<IAnalyzerResult>?>(async () =>
                 {
                     await buildSemaphore.WaitAsync();
                     try
                     {
-                        IReadOnlyList<IAnalyzerResult> tfmResults;
-                        if (cacheDirectory != null)
-                        {
-                            var binlogPath = GetBinlogCachePath(cacheDirectory, p);
-                            if (projectsNeedingRebuild!.Contains(p.ProjectFile.Path) || !File.Exists(binlogPath))
-                            {
-                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false, buildLabel);
-                                var (_, timedOut) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path, binlogPath));
-                                if (timedOut)
-                                {
-                                    if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                    else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), "build timed out");
-                                    return null;
-                                }
-                                // Read from the binlog rather than the pipe result. The pipe uses
-                                // MsBuildPipeLogger, which may not support the event types emitted by
-                                // the SDK's MSBuild version, leaving the pipe result empty even on a
-                                // successful build. The binlog is written natively by MSBuild and read
-                                // by StructuredLogger, which handles the current format regardless of
-                                // version skew.
-                                var binlogExists = File.Exists(binlogPath);
-                                tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(manager, binlogPath) : [];
-                                if (!tfmResults.Any(r => r.Succeeded))
-                                {
-                                    var reason = binlogExists ? "build log could not be read" : "build failed";
-                                    if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                    else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
-                                    return null;
-                                }
-                                // Write an initial deps sidecar with whatever project references
-                                // MSBuild returned. Binlog replay often leaves this empty (MSBuild
-                                // 17.14+ does not emit ProjectReferences into the replay). The Load
-                                // stage patches from the Roslyn workspace and overwrites the file
-                                // with the correct paths so subsequent staleness checks are accurate.
-                                WriteDepsFile(binlogPath, tfmResults.First(r => r.Succeeded).ProjectReferences.ToList());
-                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                            }
-                            else
-                            {
-                                callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), true, buildLabel);
-                                tfmResults = RealTfmResults(manager.Analyze(binlogPath));
-                                if (!tfmResults.Any(r => r.Succeeded))
-                                {
-                                    var reason = "cached build log could not be read";
-                                    if (isScanPass)
-                                        callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                    else
-                                        callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
-                                    return null;
-                                }
-                                // Project references are patched from the Roslyn workspace in the
-                                // Load stage, which also overwrites the deps sidecar. Nothing to
-                                // do here beyond signalling completion.
-                                callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                            }
-                        }
-                        else
-                        {
-                            callbacks.OnBuildStarted?.Invoke(p.ProjectFile.Path, GetProjectName(p.ProjectFile.Name), false, buildLabel);
-                            var (buildResults2, timedOut2) = await BuildWithTimeoutAsync(p, CreateBuildOptions(buildLogDirectory, p.ProjectFile.Path));
-                            if (buildResults2 == null || !buildResults2.Any(r => r.Succeeded))
-                            {
-                                var reason = timedOut2 ? "build timed out" : "build failed";
-                                if (isScanPass)
-                                    callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                                else
-                                    callbacks.OnProjectSkipped?.Invoke(p.ProjectFile.Path, Path.GetFileName(p.ProjectFile.Path), reason);
-                                return null;
-                            }
-                            tfmResults = buildResults2;
-                            callbacks.OnBuildCompleted?.Invoke(p.ProjectFile.Path);
-                        }
-                        return tfmResults;
+                        return await BuildSingleProjectAsync(project, stage);
                     }
                     finally
                     {
@@ -432,11 +383,151 @@ namespace Strazh.Analysis
                 })));
         }
 
+        private static async Task<IReadOnlyList<IAnalyzerResult>?> BuildSingleProjectAsync(
+            IProjectAnalyzer project, BuildStageContext stage)
+        {
+            var identity = new ProjectIdentity(
+                project.ProjectFile.Path,
+                GetProjectName(project.ProjectFile.Name),
+                Path.GetFileName(project.ProjectFile.Path));
+            if (stage.Cache != null)
+            {
+                return await BuildProjectWithCacheAsync(project, identity, stage);
+            }
+            return await BuildProjectWithoutCacheAsync(project, identity, stage);
+        }
+
+        private static async Task<IReadOnlyList<IAnalyzerResult>?> BuildProjectWithCacheAsync(
+            IProjectAnalyzer project, ProjectIdentity identity, BuildStageContext stage)
+        {
+            var binlogPath = GetBinlogCachePath(stage.Cache!.Value.Directory, project);
+            var state = new ProjectBuildState(project, identity, binlogPath);
+            var cached = TryReplayCachedBinlog(state, stage);
+            if (cached != null)
+            {
+                return cached;
+            }
+            return await RunFreshBuildLoopAsync(state, stage);
+        }
+
+        // Attempts to replay a cached binlog. Returns the results on success, or null if the
+        // project needs a fresh build (stale, missing, or the replay produced no succeeded results).
+        private static IReadOnlyList<IAnalyzerResult>? TryReplayCachedBinlog(
+            ProjectBuildState state, BuildStageContext stage)
+        {
+            if (stage.Cache!.Value.ProjectsNeedingRebuild.Contains(state.Identity.Path) || !File.Exists(state.BinlogPath))
+            {
+                return null;
+            }
+            stage.Callbacks.OnBuildStarted?.Invoke(state.Identity.Path, state.Identity.Name, true, stage.BuildLabel);
+            var cached = RealTfmResults(stage.Manager.Analyze(state.BinlogPath));
+            if (cached.Any(r => r.Succeeded))
+            {
+                // Project references are patched from the Roslyn workspace in the
+                // Load stage, which also overwrites the deps sidecar. Nothing to
+                // do here beyond signalling completion.
+                stage.Callbacks.OnBuildCompleted?.Invoke(state.Identity.Path);
+                return cached;
+            }
+            return null; // Stale or corrupted binlog — caller falls through to a fresh build.
+        }
+
+        // Runs up to MaxBuildAttempts fresh MSBuild invocations, deleting a bad binlog between
+        // retries. Returns results on the first successful attempt, or null after all attempts fail.
+        private static async Task<IReadOnlyList<IAnalyzerResult>?> RunFreshBuildLoopAsync(
+            ProjectBuildState state, BuildStageContext stage)
+        {
+            for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
+            {
+                stage.Callbacks.OnBuildStarted?.Invoke(state.Identity.Path, state.Identity.Name, false, stage.BuildLabel);
+                var outcome = await BuildWithTimeoutAsync(state.Project, CreateBuildOptions(stage.BuildLogDirectory, state.Identity.Path, binlogPath: state.BinlogPath));
+                if (outcome.TimedOut)
+                {
+                    SignalBuildNotCompleted(state.Identity, reason: "build timed out", stage);
+                    return null;
+                }
+                // Read from the binlog rather than the pipe result. The pipe uses
+                // MsBuildPipeLogger, which may not support the event types emitted by
+                // the SDK's MSBuild version, leaving the pipe result empty even on a
+                // successful build. The binlog is written natively by MSBuild and read
+                // by StructuredLogger, which handles the current format regardless of
+                // version skew.
+                var binlogExists = File.Exists(state.BinlogPath);
+                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(stage.Manager, state.BinlogPath) : [];
+                if (tfmResults.Any(r => r.Succeeded))
+                {
+                    // Write an initial deps sidecar with whatever project references
+                    // MSBuild returned. Binlog replay often leaves this empty (MSBuild
+                    // 17.14+ does not emit ProjectReferences into the replay). The Load
+                    // stage patches from the Roslyn workspace and overwrites the file
+                    // with the correct paths so subsequent staleness checks are accurate.
+                    WriteDepsFile(state.BinlogPath, tfmResults.First(r => r.Succeeded).ProjectReferences.ToList());
+                    stage.Callbacks.OnBuildCompleted?.Invoke(state.Identity.Path);
+                    return tfmResults;
+                }
+                else if (attempt < MaxBuildAttempts)
+                {
+                    if (binlogExists)
+                    {
+                        File.Delete(state.BinlogPath);
+                    }
+                }
+                else
+                {
+                    var reason = binlogExists ? "build log could not be read" : "build failed";
+                    SignalBuildNotCompleted(state.Identity, reason, stage);
+                    return null;
+                }
+            }
+            return null; // unreachable — loop always returns
+        }
+
+        private static async Task<IReadOnlyList<IAnalyzerResult>?> BuildProjectWithoutCacheAsync(
+            IProjectAnalyzer project, ProjectIdentity identity, BuildStageContext stage)
+        {
+            for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
+            {
+                stage.Callbacks.OnBuildStarted?.Invoke(identity.Path, identity.Name, false, stage.BuildLabel);
+                var outcome = await BuildWithTimeoutAsync(project, CreateBuildOptions(stage.BuildLogDirectory, identity.Path));
+                if (outcome.TimedOut)
+                {
+                    SignalBuildNotCompleted(identity, reason: "build timed out", stage);
+                    return null;
+                }
+                if (outcome.Results != null && outcome.Results.Any(r => r.Succeeded))
+                {
+                    stage.Callbacks.OnBuildCompleted?.Invoke(identity.Path);
+                    return outcome.Results;
+                }
+                if (attempt == MaxBuildAttempts)
+                {
+                    SignalBuildNotCompleted(identity, reason: "build failed", stage);
+                    return null;
+                }
+            }
+            return null; // unreachable — loop always returns
+        }
+
+        private static void SignalBuildNotCompleted(ProjectIdentity identity, string reason, BuildStageContext stage)
+        {
+            if (stage.IsScanPass)
+            {
+                stage.Callbacks.OnBuildCompleted?.Invoke(identity.Path);
+            }
+            else
+            {
+                stage.Callbacks.OnProjectSkipped?.Invoke(identity.Path, identity.FileName, reason);
+            }
+        }
+
         // If a build hangs (e.g. Android/MAUI projects waiting on SDK tools not present in the
         // environment), WhenAny returns after the timeout and we skip the project. The underlying
         // Task.Run continues to hold its thread until the process eventually exits or is reaped
         // when the parent process terminates — that is acceptable.
         private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(5);
+        private const int MaxBuildAttempts = 3;
+        // MD5 produces 32 hex chars; 8 is enough to make collisions negligible across a solution.
+        private const int HashPrefixLength = 8;
 
         // Reads the binlog, retrying once after a short delay if the first attempt yields no
         // results. The MSBuild child process closes its stdout pipe (causing p.Build() to return)
@@ -454,18 +545,20 @@ namespace Strazh.Analysis
             return RealTfmResults(manager.Analyze(binlogPath));
         }
 
-        private static async Task<(IReadOnlyList<IAnalyzerResult>? results, bool timedOut)> BuildWithTimeoutAsync(IProjectAnalyzer p, EnvironmentOptions opts)
+        private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut);
+
+        private static async Task<BuildOutcome> BuildWithTimeoutAsync(IProjectAnalyzer project, EnvironmentOptions opts)
         {
             var buildTask = Task.Run<IReadOnlyList<IAnalyzerResult>?>(() =>
             {
-                var results = RealTfmResults(p.Build(opts));
+                var results = RealTfmResults(project.Build(opts));
                 return results.Count > 0 ? results : null;
             });
             if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
             {
-                return (null, timedOut: true);
+                return new BuildOutcome(Results: null, TimedOut: true);
             }
-            return (await buildTask.ConfigureAwait(false), timedOut: false);
+            return new BuildOutcome(await buildTask.ConfigureAwait(false), TimedOut: false);
         }
 
         // Filters out entries that don't correspond to a real target-framework build.
@@ -505,7 +598,7 @@ namespace Strazh.Analysis
             {
                 var displayName = GetProjectName(Path.GetFileName(projectFilePath));
                 var bytes = MD5.HashData(Encoding.UTF8.GetBytes(projectFilePath));
-                var hash = Convert.ToHexString(bytes)[..8];
+                var hash = Convert.ToHexString(bytes)[..HashPrefixLength];
                 var logFile = Path.Combine(buildLogDirectory, $"{displayName}_{hash}.log");
                 opts.Arguments.Add($"\"/fileLoggerParameters:LogFile={logFile};Verbosity=normal;Append\"");
             }
@@ -523,11 +616,11 @@ namespace Strazh.Analysis
             return workspace;
         }
 
-        private static string GetBinlogCachePath(string cacheDirectory, IProjectAnalyzer p)
+        private static string GetBinlogCachePath(string cacheDirectory, IProjectAnalyzer project)
         {
-            var bytes = MD5.HashData(Encoding.UTF8.GetBytes(p.ProjectFile.Path));
-            var hash = Convert.ToHexString(bytes)[..8];
-            return Path.Combine(cacheDirectory, $"{p.ProjectFile.Name}_{hash}.binlog");
+            var bytes = MD5.HashData(Encoding.UTF8.GetBytes(project.ProjectFile.Path));
+            var hash = Convert.ToHexString(bytes)[..HashPrefixLength];
+            return Path.Combine(cacheDirectory, $"{project.ProjectFile.Name}_{hash}.binlog");
         }
 
         // Returns true if no binlog exists, or if the binlog is older than any source or
@@ -730,13 +823,17 @@ namespace Strazh.Analysis
             IReadOnlyList<IAnalyzerResult> tfmGroup, Project roslynProject, AdhocWorkspace workspace)
         {
             if (tfmGroup.Any(r => r.ProjectReferences.Any()))
+            {
                 return tfmGroup;
+            }
             var refPaths = roslynProject.ProjectReferences
                 .Select(pr => workspace.CurrentSolution.GetProject(pr.ProjectId)?.FilePath)
                 .OfType<string>()
                 .ToList();
             if (refPaths.Count == 0)
+            {
                 return tfmGroup;
+            }
             return tfmGroup
                 .Select(r => (IAnalyzerResult)new AnalyzerResultWithProjectRefs(r, refPaths))
                 .ToList();
