@@ -225,7 +225,7 @@ namespace Strazh.Analysis
             {
                 await RunBuildStageAsync(new BuildStageContext(
                     manager, new CacheContext(options.CacheDirectory, projectsNeedingRebuild!),
-                    options.Callbacks, BuildLabel: "Scanning", IsScanPass: true, options.BuildLogDirectory));
+                    options.Callbacks, BuildLabel: "Building", IsScanPass: true, options.BuildLogDirectory));
                 // Re-derive the rebuild set without the noCache override — the scan pass
                 // just built everything fresh, so nothing should be considered stale.
                 projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
@@ -241,7 +241,7 @@ namespace Strazh.Analysis
                 ? new CacheContext(options.CacheDirectory, projectsNeedingRebuild!)
                 : null;
             IReadOnlyList<IAnalyzerResult>?[] results = await RunBuildStageAsync(new BuildStageContext(
-                manager, mainCache, options.Callbacks, BuildLabel: "Building", IsScanPass: false, options.BuildLogDirectory));
+                manager, mainCache, options.Callbacks, BuildLabel: "Scanning", IsScanPass: false, options.BuildLogDirectory));
 
             // Load stage: add each completed result to the workspace and yield immediately,
             // so analysis can begin on each project without waiting for all to be loaded.
@@ -360,7 +360,7 @@ namespace Strazh.Analysis
         // one result slot per project (null for skipped/failed projects).
         //
         // buildLabel is forwarded to OnBuildStarted so the progress UI can distinguish
-        // "Scanning" (dependency-discovery pass) from "Building" (main pass).
+        // "Building" (dependency-discovery pass) from "Scanning" (main pass).
         //
         // isScanPass suppresses OnProjectSkipped for failures: scan failures are pre-work
         // noise that will be reported properly by the main pass. OnBuildCompleted is called

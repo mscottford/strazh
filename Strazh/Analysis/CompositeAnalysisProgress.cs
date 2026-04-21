@@ -35,7 +35,7 @@ namespace Strazh.Analysis
             return current();
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel = "Building")
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel)
         {
             foreach (var impl in _implementations)
             {

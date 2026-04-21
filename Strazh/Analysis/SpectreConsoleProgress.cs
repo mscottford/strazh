@@ -81,7 +81,7 @@ namespace Strazh.Analysis
                 });
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel = "Building")
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel)
         {
             _names[projectFilePath] = projectName;
             _buildLabels[projectFilePath] = buildLabel;
@@ -94,7 +94,7 @@ namespace Strazh.Analysis
         {
             // Scan-pass entries are pre-work: silently remove them from the active display
             // rather than transitioning to "Loading" (they have no load or analysis step).
-            if (_buildLabels.TryGetValue(projectFilePath, out var label) && label == "Scanning")
+            if (_buildLabels.TryGetValue(projectFilePath, out var label) && label == "Building")
             {
                 _active.TryRemove(projectFilePath, out _);
             }

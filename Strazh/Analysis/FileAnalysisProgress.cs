@@ -54,7 +54,7 @@ namespace Strazh.Analysis
             }
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel = "Building")
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel)
         {
             var now = DateTime.UtcNow;
             _startTimes[projectFilePath] = now;
