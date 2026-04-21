@@ -54,11 +54,11 @@ namespace Strazh.Analysis
             }
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel)
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, BuildStageLabel buildLabel)
         {
             var now = DateTime.UtcNow;
             _startTimes[projectFilePath] = now;
-            Write("BUILD_STARTED", $"cache={isCacheHit.ToString().ToLowerInvariant()} label={Q(buildLabel)} name={Q(projectName)} path={Q(projectFilePath)}");
+            Write("BUILD_STARTED", $"cache={isCacheHit.ToString().ToLowerInvariant()} label={Q(buildLabel.ToString())} name={Q(projectName)} path={Q(projectFilePath)}");
         }
 
         public void OnBuildCompleted(string projectFilePath)

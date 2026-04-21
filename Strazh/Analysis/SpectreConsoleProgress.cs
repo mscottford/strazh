@@ -25,7 +25,7 @@ namespace Strazh.Analysis
             new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> _names =
             new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, string> _buildLabels =
+        private readonly ConcurrentDictionary<string, BuildStageLabel> _buildLabels =
             new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, DateTime> _startTimes =
             new(StringComparer.OrdinalIgnoreCase);
@@ -81,20 +81,20 @@ namespace Strazh.Analysis
                 });
         }
 
-        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, string buildLabel)
+        public void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, BuildStageLabel buildLabel)
         {
             _names[projectFilePath] = projectName;
             _buildLabels[projectFilePath] = buildLabel;
             var now = DateTime.UtcNow;
             _startTimes[projectFilePath] = now;
-            _active[projectFilePath] = new TaskEntry(projectName, isCacheHit ? "Cached" : buildLabel, now, now);
+            _active[projectFilePath] = new TaskEntry(projectName, isCacheHit ? "Cached" : buildLabel.ToString(), now, now);
         }
 
         public void OnBuildCompleted(string projectFilePath)
         {
-            // Scan-pass entries are pre-work: silently remove them from the active display
+            // Building-pass entries are pre-work: silently remove them from the active display
             // rather than transitioning to "Loading" (they have no load or analysis step).
-            if (_buildLabels.TryGetValue(projectFilePath, out var label) && label == "Building")
+            if (_buildLabels.TryGetValue(projectFilePath, out var label) && label == BuildStageLabel.Building)
             {
                 _active.TryRemove(projectFilePath, out _);
             }

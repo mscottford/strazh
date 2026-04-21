@@ -163,7 +163,7 @@ namespace Strazh.Analysis
         // AdhocWorkspace is not thread-safe, so workspace mutations remain sequential.
         private readonly struct StreamCallbacks
         {
-            public Action<string, string, bool, string>? OnBuildStarted { get; init; }
+            public Action<string, string, bool, BuildStageLabel>? OnBuildStarted { get; init; }
             public Action<string>? OnBuildCompleted { get; init; }
             public Action<string, string, string>? OnProjectSkipped { get; init; }
         }
@@ -178,12 +178,12 @@ namespace Strazh.Analysis
             string Directory,
             HashSet<string> ProjectsNeedingRebuild);
 
-        // Carries the full context for one build stage (Scanning or Building).
+        // Carries the full context for one build stage (Building or Graphing).
         private readonly record struct BuildStageContext(
             IAnalyzerManager Manager,
             CacheContext? Cache,
             StreamCallbacks Callbacks,
-            string BuildLabel,
+            BuildStageLabel BuildLabel,
             bool IsScanPass,
             string? BuildLogDirectory);
 
@@ -214,34 +214,35 @@ namespace Strazh.Analysis
                     : ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
             }
 
-            // Scan pass: if any project is missing a .deps sidecar the dependency graph is
+            // Building pass: if any project is missing a .deps sidecar the dependency graph is
             // incomplete, so we cannot reliably detect transitive staleness or know which
             // projects are safe to build in parallel without their dependencies present.
-            // Build everything in parallel first (Scanning) to populate binlog cache and
+            // Run full MSBuild invocations for all projects to populate the binlog cache and
             // .deps files, then re-derive the rebuild set from the now-complete graph before
-            // the main build pass. On warm-cache runs all .deps files exist and this is skipped.
+            // the Graphing pass. On warm-cache runs all .deps files exist and this is skipped.
             if (options.CacheDirectory != null && manager.Projects.Values.Any(
                     p => !File.Exists(GetBinlogCachePath(options.CacheDirectory, p) + ".deps")))
             {
                 await RunBuildStageAsync(new BuildStageContext(
                     manager, new CacheContext(options.CacheDirectory, projectsNeedingRebuild!),
-                    options.Callbacks, BuildLabel: "Building", IsScanPass: true, options.BuildLogDirectory));
-                // Re-derive the rebuild set without the noCache override — the scan pass
+                    options.Callbacks, BuildLabel: BuildStageLabel.Building, IsScanPass: true, options.BuildLogDirectory));
+                // Re-derive the rebuild set without the noCache override — the Building pass
                 // just built everything fresh, so nothing should be considered stale.
                 projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
             }
 
-            // Main build pass: run MSBuild design-time builds in parallel, capped at the
-            // number of logical processors. Each project may target multiple frameworks;
-            // the build task returns all TFM results so each one can be analyzed independently.
+            // Graphing pass: replays the binlog cache for each project (or runs a fresh MSBuild
+            // build if the cache is stale), then loads the results into the Roslyn workspace for
+            // triple extraction, grouping, and insertion into the graph database. Each project may
+            // target multiple frameworks; results from all TFMs are analyzed independently.
             // A project is considered successful if at least one TFM produces a result.
-            // After a scan pass this is mostly cache replays (fast); on warm-cache runs it
+            // After a Building pass this is mostly cache replays (fast); on warm-cache runs it
             // rebuilds only the stale subset.
             CacheContext? mainCache = options.CacheDirectory != null
                 ? new CacheContext(options.CacheDirectory, projectsNeedingRebuild!)
                 : null;
             IReadOnlyList<IAnalyzerResult>?[] results = await RunBuildStageAsync(new BuildStageContext(
-                manager, mainCache, options.Callbacks, BuildLabel: "Scanning", IsScanPass: false, options.BuildLogDirectory));
+                manager, mainCache, options.Callbacks, BuildLabel: BuildStageLabel.Graphing, IsScanPass: false, options.BuildLogDirectory));
 
             // Load stage: add each completed result to the workspace and yield immediately,
             // so analysis can begin on each project without waiting for all to be loaded.
@@ -360,7 +361,7 @@ namespace Strazh.Analysis
         // one result slot per project (null for skipped/failed projects).
         //
         // buildLabel is forwarded to OnBuildStarted so the progress UI can distinguish
-        // "Building" (dependency-discovery pass) from "Scanning" (main pass).
+        // Building (dependency-discovery pass) from Graphing (knowledge-graph pass).
         //
         // isScanPass suppresses OnProjectSkipped for failures: scan failures are pre-work
         // noise that will be reported properly by the main pass. OnBuildCompleted is called
