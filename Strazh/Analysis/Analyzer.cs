@@ -394,24 +394,58 @@ namespace Strazh.Analysis
             string? buildLogDirectory)
         {
             var binlogPath = GetBinlogCachePath(cacheDirectory, p);
-
-            // Cache-hit: replay the existing binlog; fall through to fresh build on failure.
-            if (!projectsNeedingRebuild.Contains(projectPath) && File.Exists(binlogPath))
+            var cached = TryReplayCachedBinlog(manager, projectsNeedingRebuild, projectPath, projectName,
+                binlogPath, callbacks, buildLabel);
+            if (cached != null)
             {
-                callbacks.OnBuildStarted?.Invoke(projectPath, projectName, true, buildLabel);
-                var cached = RealTfmResults(manager.Analyze(binlogPath));
-                if (cached.Any(r => r.Succeeded))
-                {
-                    // Project references are patched from the Roslyn workspace in the
-                    // Load stage, which also overwrites the deps sidecar. Nothing to
-                    // do here beyond signalling completion.
-                    callbacks.OnBuildCompleted?.Invoke(projectPath);
-                    return cached;
-                }
-                // Stale or corrupted cached binlog — fall through to a fresh build.
+                return cached;
             }
+            return await RunFreshBuildLoopAsync(p, manager, binlogPath, projectPath, projectName, projectFileName,
+                callbacks, buildLabel, isScanPass, buildLogDirectory);
+        }
 
-            // Fresh-build retry loop (max MaxBuildAttempts attempts).
+        // Attempts to replay a cached binlog. Returns the results on success, or null if the
+        // project needs a fresh build (stale, missing, or the replay produced no succeeded results).
+        private static IReadOnlyList<IAnalyzerResult>? TryReplayCachedBinlog(
+            IAnalyzerManager manager,
+            HashSet<string> projectsNeedingRebuild,
+            string projectPath,
+            string projectName,
+            string binlogPath,
+            StreamCallbacks callbacks,
+            string buildLabel)
+        {
+            if (projectsNeedingRebuild.Contains(projectPath) || !File.Exists(binlogPath))
+            {
+                return null;
+            }
+            callbacks.OnBuildStarted?.Invoke(projectPath, projectName, true, buildLabel);
+            var cached = RealTfmResults(manager.Analyze(binlogPath));
+            if (cached.Any(r => r.Succeeded))
+            {
+                // Project references are patched from the Roslyn workspace in the
+                // Load stage, which also overwrites the deps sidecar. Nothing to
+                // do here beyond signalling completion.
+                callbacks.OnBuildCompleted?.Invoke(projectPath);
+                return cached;
+            }
+            return null; // Stale or corrupted binlog — caller falls through to a fresh build.
+        }
+
+        // Runs up to MaxBuildAttempts fresh MSBuild invocations, deleting a bad binlog between
+        // retries. Returns results on the first successful attempt, or null after all attempts fail.
+        private static async Task<IReadOnlyList<IAnalyzerResult>?> RunFreshBuildLoopAsync(
+            IProjectAnalyzer p,
+            IAnalyzerManager manager,
+            string binlogPath,
+            string projectPath,
+            string projectName,
+            string projectFileName,
+            StreamCallbacks callbacks,
+            string buildLabel,
+            bool isScanPass,
+            string? buildLogDirectory)
+        {
             for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
             {
                 callbacks.OnBuildStarted?.Invoke(projectPath, projectName, false, buildLabel);
