@@ -38,7 +38,7 @@ namespace Strazh.Analysis
         /// <param name="buildLabel">
         /// Short label for the build stage shown in the progress UI.
         /// Use <see cref="BuildStageLabel.Building"/> for the dependency-discovery pass and
-        /// <see cref="BuildStageLabel.Graphing"/> for the knowledge-graph pass.
+        /// <see cref="BuildStageLabel.PostBuild"/> for the knowledge-graph pass.
         /// </param>
         void OnBuildStarted(string projectFilePath, string projectName, bool isCacheHit, BuildStageLabel buildLabel);
 

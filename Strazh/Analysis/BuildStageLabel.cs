@@ -14,10 +14,10 @@ namespace Strazh.Analysis
         Building,
 
         /// <summary>
-        /// The knowledge-graph pass. Replays the binlog cache (or runs a fresh MSBuild build
-        /// if the cache is stale) then loads the results into the Roslyn workspace for triple
-        /// extraction, grouping, and insertion into the graph database.
+        /// The post-build pass. Replays the binlog cache (or runs a fresh MSBuild build if the
+        /// cache is stale) then loads the results into the Roslyn workspace for triple extraction,
+        /// grouping, and insertion into the graph database.
         /// </summary>
-        Graphing,
+        PostBuild,
     }
 }
