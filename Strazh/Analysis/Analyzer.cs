@@ -421,7 +421,18 @@ namespace Strazh.Analysis
                 return null;
             }
             stage.Callbacks.OnBuildStarted?.Invoke(state.Identity.Path, state.Identity.Name, true, stage.BuildLabel);
-            var cached = RealTfmResults(stage.Manager.Analyze(state.BinlogPath));
+            IReadOnlyList<IAnalyzerResult> cached;
+            try
+            {
+                cached = RealTfmResults(stage.Manager.Analyze(state.BinlogPath));
+            }
+            catch (FileNotFoundException)
+            {
+                // File.Exists passed but the file was deleted by a concurrent task between the
+                // check and the read (e.g. another project's retry loop sharing the same binlog
+                // path due to a hash-prefix collision). Fall through to a fresh build.
+                return null;
+            }
             if (cached.Any(r => r.Succeeded))
             {
                 // Project references are patched from the Roslyn workspace in the
@@ -537,13 +548,28 @@ namespace Strazh.Analysis
         // Returns all TFM results from the binlog (one per target framework for multi-target projects).
         private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
         {
-            var results = RealTfmResults(manager.Analyze(binlogPath));
+            IReadOnlyList<IAnalyzerResult> results;
+            try
+            {
+                results = RealTfmResults(manager.Analyze(binlogPath));
+            }
+            catch (FileNotFoundException)
+            {
+                return [];
+            }
             if (results.Count > 0)
             {
                 return results;
             }
             await Task.Delay(500).ConfigureAwait(false);
-            return RealTfmResults(manager.Analyze(binlogPath));
+            try
+            {
+                return RealTfmResults(manager.Analyze(binlogPath));
+            }
+            catch (FileNotFoundException)
+            {
+                return [];
+            }
         }
 
         private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut);
