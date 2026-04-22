@@ -2,22 +2,23 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 using Strazh.Domain;
 
 namespace Strazh.Analysis
 {
     /// <summary>
     /// Implements <see cref="IAnalysisProgress"/> using Spectre.Console's Progress display.
-    /// A single <see cref="ProgressTask"/> holds a multi-line description that is rebuilt
-    /// every 80 ms by a ticker, always showing the most-recently-updated projects at the top
-    /// and capping the panel height to leave room for completed-project lines in the scrollback.
+    /// A single <see cref="ProgressTask"/> is rendered by a custom <see cref="PanelColumn"/>
+    /// that rebuilds a multi-line <see cref="Rows"/> renderable on every frame, always showing
+    /// the most-recently-updated projects at the top and capping height to leave room for
+    /// completed-project lines in the terminal scrollback.
     /// Completed and skipped lines are written via <see cref="AnsiConsole.MarkupLine"/>, which
-    /// Progress's render hook intercepts, clears the panel, writes the line to the terminal
-    /// scrollback, and re-renders the panel below — leaving the terminal state clean.
+    /// Progress's render hook intercepts, clears the panel, writes the line to the scrollback,
+    /// and re-renders the panel below — leaving the terminal state clean.
     /// All methods except <see cref="WrapAsync"/> may be called concurrently from multiple tasks.
     /// </summary>
     public sealed class SpectreConsoleProgress : IAnalysisProgress
@@ -44,10 +45,10 @@ namespace Strazh.Analysis
             _total = totalProjects;
             await AnsiConsole.Progress()
                 .AutoClear(true)
-                .Columns(new TaskDescriptionColumn { Alignment = Justify.Left })
+                .Columns(new PanelColumn(this))
                 .StartAsync(async ctx =>
                 {
-                    var panelTask = ctx.AddTask(BuildDescription());
+                    ctx.AddTask(string.Empty);
                     using var cts = new CancellationTokenSource();
                     var ticker = Task.Run(async () =>
                     {
@@ -55,7 +56,6 @@ namespace Strazh.Analysis
                         {
                             await Task.Delay(80).ConfigureAwait(false);
                             Interlocked.Increment(ref _tick);
-                            panelTask.Description = BuildDescription();
                         }
                     });
                     try
@@ -162,7 +162,7 @@ namespace Strazh.Analysis
             }
         }
 
-        private string BuildDescription()
+        private IRenderable BuildRenderable()
         {
             var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
             // Reserve rows for completed-project lines so they remain visible above the panel.
@@ -175,23 +175,36 @@ namespace Strazh.Analysis
             var completed = Volatile.Read(ref _completed);
             var remaining = Math.Max(0, _total - completed);
 
-            var sb = new StringBuilder();
+            var rows = new List<IRenderable>(entries.Count + 2);
             foreach (var entry in entries)
             {
                 var elapsed = DateTime.UtcNow - entry.StartTime;
-                sb.Append($"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(elapsed)}[/]\n");
+                rows.Add(new Markup(
+                    $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(elapsed)}[/]"));
             }
             if (hidden > 0)
             {
-                sb.Append($"[dim]  … {hidden} more running[/]\n");
+                rows.Add(new Markup($"[dim]  … {hidden} more running[/]"));
             }
-            sb.Append($"[dim]{completed} done · {remaining} remaining[/]");
-            return sb.ToString();
+            rows.Add(new Markup($"[dim]{completed} done · {remaining} remaining[/]"));
+            return new Rows(rows);
         }
 
         private static string FormatElapsed(TimeSpan elapsed)
             => elapsed.TotalSeconds < 60
                 ? $"{elapsed.TotalSeconds:F1}s"
                 : $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s";
+
+        /// <summary>
+        /// Single-column renderer for the panel task. Returns a multi-line
+        /// <see cref="Rows"/> renderable so each active project appears on its own line.
+        /// </summary>
+        private sealed class PanelColumn : ProgressColumn
+        {
+            private readonly SpectreConsoleProgress _owner;
+            internal PanelColumn(SpectreConsoleProgress owner) => _owner = owner;
+            public override IRenderable Render(RenderOptions options, ProgressTask task, TimeSpan deltaTime)
+                => _owner.BuildRenderable();
+        }
     }
 }
