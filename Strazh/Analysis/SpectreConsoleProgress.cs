@@ -188,15 +188,12 @@ namespace Strazh.Analysis
             return (completed, Math.Max(0, _total - completed));
         }
 
-        private (List<TaskEntry> entries, int paddingRows) GetSortedEntries()
+        private List<TaskEntry> GetSortedEntries()
         {
-            // Reserve 1 row for the summary line and 1 for breathing room.
-            var terminalHeight = AnsiConsole.Console.Profile.Height;
-            var maxContentRows = Math.Max(1, terminalHeight - 2);
-            var entries = _active.Values.OrderByDescending(e => e.LastChanged).Take(maxContentRows).ToList();
-            // Pad above the active entries so the summary line sits at the bottom of the terminal.
-            var paddingRows = Math.Max(0, maxContentRows - entries.Count);
-            return (entries, paddingRows);
+            // Cap at terminal height minus 2 rows (summary line + breathing room) so the
+            // live panel never overflows the terminal when many projects are in flight.
+            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 2);
+            return _active.Values.OrderByDescending(e => e.LastChanged).Take(maxContentRows).ToList();
         }
 
         private static string FormatElapsed(TimeSpan elapsed)
@@ -219,14 +216,8 @@ namespace Strazh.Analysis
             public IEnumerable<Segment> Render(RenderOptions options, int maxWidth)
             {
                 var frame = _owner.GetSpinnerFrame();
-                var (entries, paddingRows) = _owner.GetSortedEntries();
+                var entries = _owner.GetSortedEntries();
                 var (completed, remaining) = _owner.GetCounts();
-
-                // Blank lines above the active-task block push it toward the bottom of the terminal.
-                for (var i = 0; i < paddingRows; i++)
-                {
-                    yield return Segment.LineBreak;
-                }
 
                 foreach (var entry in entries)
                 {
