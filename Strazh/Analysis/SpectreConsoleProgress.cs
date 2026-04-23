@@ -48,7 +48,7 @@ namespace Strazh.Analysis
                 .Columns(new PanelColumn(this))
                 .StartAsync(async ctx =>
                 {
-                    ctx.AddTask(string.Empty);
+                    ctx.AddTask(" ");
                     using var cts = new CancellationTokenSource();
                     var ticker = Task.Run(async () =>
                     {
