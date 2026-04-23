@@ -11,10 +11,14 @@ using Strazh.Domain;
 namespace Strazh.Analysis
 {
     /// <summary>
-    /// Implements <see cref="IAnalysisProgress"/> using Spectre.Console's Live display.
-    /// Active tasks are sorted by most-recently-updated so that any task receiving a stage
-    /// change floats to the top of the visible area, even when more projects are in flight
-    /// than the terminal can display at once.
+    /// Implements <see cref="IAnalysisProgress"/> using Spectre.Console's Progress display.
+    /// A single <see cref="ProgressTask"/> is rendered by a custom <see cref="PanelColumn"/>
+    /// that rebuilds a multi-line <see cref="Rows"/> renderable on every frame, always showing
+    /// the most-recently-updated projects at the top and capping height to leave room for
+    /// completed-project lines in the terminal scrollback.
+    /// Completed and skipped lines are written via <see cref="AnsiConsole.MarkupLine"/>, which
+    /// Progress's render hook intercepts, clears the panel, writes the line to the scrollback,
+    /// and re-renders the panel below — leaving the terminal state clean.
     /// All methods except <see cref="WrapAsync"/> may be called concurrently from multiple tasks.
     /// </summary>
     public sealed class SpectreConsoleProgress : IAnalysisProgress
@@ -29,29 +33,22 @@ namespace Strazh.Analysis
             new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, DateTime> _startTimes =
             new(StringComparer.OrdinalIgnoreCase);
-        // Console writes (above the live area) must all come from the ticker thread to avoid
-        // interleaving with ctx.Refresh(), which causes Spectre.Console to corrupt its cursor
-        // position and crash the ticker. Concurrent callers enqueue an action; the ticker
-        // drains the queue before each Refresh().
-        private readonly ConcurrentQueue<Action> _pendingWrites = new();
-        private LiveDisplayContext? _ctx;
         private int _tick;
         private int _total;
         private int _completed;
 
-        // Dots spinner frames — same set used by Spectre.Console's built-in SpinnerColumn.
         private static readonly string[] SpinnerFrames =
             ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-        public Task WrapAsync(int totalProjects, Func<Task> action)
+        public async Task WrapAsync(int totalProjects, Func<Task> action)
         {
             _total = totalProjects;
-            return AnsiConsole.Live(new ActiveTasksRenderable(this))
+            await AnsiConsole.Progress()
                 .AutoClear(true)
-                .Overflow(VerticalOverflow.Ellipsis)
+                .Columns(new PanelColumn(this))
                 .StartAsync(async ctx =>
                 {
-                    _ctx = ctx;
+                    ctx.AddTask(".");
                     using var cts = new CancellationTokenSource();
                     var ticker = Task.Run(async () =>
                     {
@@ -59,14 +56,6 @@ namespace Strazh.Analysis
                         {
                             await Task.Delay(80).ConfigureAwait(false);
                             Interlocked.Increment(ref _tick);
-                            if (!cts.IsCancellationRequested)
-                            {
-                                while (_pendingWrites.TryDequeue(out var write))
-                                {
-                                    write();
-                                }
-                                ctx.Refresh();
-                            }
                         }
                     });
                     try
@@ -92,8 +81,8 @@ namespace Strazh.Analysis
 
         public void OnBuildCompleted(string projectFilePath)
         {
-            // Building-pass entries are pre-work: silently remove them from the active display
-            // rather than transitioning to "Loading" (they have no load or analysis step).
+            // Building-pass entries are pre-work: silently remove them rather than
+            // transitioning to "Loading" (they have no load or analysis step).
             if (_buildLabels.TryGetValue(projectFilePath, out var label) && label == BuildStageLabel.Building)
             {
                 _active.TryRemove(projectFilePath, out _);
@@ -115,10 +104,9 @@ namespace Strazh.Analysis
             _active.TryRemove(projectFilePath, out _);
             var name = _names.TryGetValue(projectFilePath, out var n) ? n : projectFilePath;
             var elapsed = DateTime.UtcNow - (_startTimes.TryGetValue(projectFilePath, out var st) ? st : DateTime.UtcNow);
-            var markup =
+            AnsiConsole.MarkupLine(
                 $"[green]✓[/] [bold]{Markup.Escape(name)}[/]  " +
-                $"[dim]{FormatElapsed(elapsed)}[/]  {tripleCount} triples";
-            _pendingWrites.Enqueue(() => AnsiConsole.MarkupLine(markup));
+                $"[dim]{FormatElapsed(elapsed)}[/]  {tripleCount} triples");
         }
 
         public void OnProjectSkipped(string projectFilePath, string filename, string reason)
@@ -142,33 +130,28 @@ namespace Strazh.Analysis
             {
                 label = "[yellow]Skipped[/]";
             }
-            var markup = $"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})";
-            _pendingWrites.Enqueue(() => AnsiConsole.MarkupLine(markup));
+            AnsiConsole.MarkupLine($"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})");
         }
 
         public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples)
         {
-            var capturedTriples = triples.ToList();
-            _pendingWrites.Enqueue(() =>
+            AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");
+            AnsiConsole.WriteLine("[");
+            var first = true;
+            foreach (var triple in triples)
             {
-                AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");
-                AnsiConsole.WriteLine("[");
-                var first = true;
-                foreach (var triple in capturedTriples)
+                if (!first)
                 {
-                    if (!first)
-                    {
-                        AnsiConsole.WriteLine(",");
-                    }
-                    AnsiConsole.Write(new Text($$"""{ "triple": {{ triple.ToInspection()}} }"""));
-                    first = false;
+                    AnsiConsole.WriteLine(",");
                 }
-                if (capturedTriples.Count > 0)
-                {
-                    AnsiConsole.WriteLine("");
-                }
-                AnsiConsole.WriteLine("]");
-            });
+                AnsiConsole.Write(new Text($$"""  { "triple": {{ triple.ToInspection()}} }"""));
+                first = false;
+            }
+            if (triples.Count > 0)
+            {
+                AnsiConsole.WriteLine("");
+            }
+            AnsiConsole.WriteLine("]");
         }
 
         private void UpdateEntry(string projectFilePath, string stage)
@@ -179,21 +162,32 @@ namespace Strazh.Analysis
             }
         }
 
-        private string GetSpinnerFrame()
-            => SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
-
-        private (int completed, int remaining) GetCounts()
+        private IRenderable BuildRenderable()
         {
+            var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
+            // Reserve rows for completed-project lines so they remain visible above the panel.
+            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 5);
+            var entries = _active.Values
+                .OrderByDescending(e => e.LastChanged)
+                .Take(maxContentRows)
+                .ToList();
+            var hidden = Math.Max(0, _active.Count - entries.Count);
             var completed = Volatile.Read(ref _completed);
-            return (completed, Math.Max(0, _total - completed));
-        }
+            var remaining = Math.Max(0, _total - completed);
 
-        private List<TaskEntry> GetSortedEntries()
-        {
-            // Cap at terminal height minus 2 rows (summary line + breathing room) so the
-            // live panel never overflows the terminal when many projects are in flight.
-            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 2);
-            return _active.Values.OrderByDescending(e => e.LastChanged).Take(maxContentRows).ToList();
+            var rows = new List<IRenderable>(entries.Count + 2);
+            foreach (var entry in entries)
+            {
+                var elapsed = DateTime.UtcNow - entry.StartTime;
+                rows.Add(new Markup(
+                    $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(elapsed)}[/]"));
+            }
+            if (hidden > 0)
+            {
+                rows.Add(new Markup($"[dim]  … {hidden} more running[/]"));
+            }
+            rows.Add(new Markup($"[dim]{completed} done · {remaining} remaining[/]"));
+            return new Rows(rows);
         }
 
         private static string FormatElapsed(TimeSpan elapsed)
@@ -202,42 +196,15 @@ namespace Strazh.Analysis
                 : $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s";
 
         /// <summary>
-        /// Live-renderable that rebuilds on every <see cref="LiveDisplayContext.Refresh"/> call,
-        /// always placing the most recently updated task at the top.
+        /// Single-column renderer for the panel task. Returns a multi-line
+        /// <see cref="Rows"/> renderable so each active project appears on its own line.
         /// </summary>
-        private sealed class ActiveTasksRenderable : IRenderable
+        private sealed class PanelColumn : ProgressColumn
         {
             private readonly SpectreConsoleProgress _owner;
-
-            public ActiveTasksRenderable(SpectreConsoleProgress owner) => _owner = owner;
-
-            public Measurement Measure(RenderOptions options, int maxWidth) => new(0, maxWidth);
-
-            public IEnumerable<Segment> Render(RenderOptions options, int maxWidth)
-            {
-                var frame = _owner.GetSpinnerFrame();
-                var entries = _owner.GetSortedEntries();
-                var (completed, remaining) = _owner.GetCounts();
-
-                foreach (var entry in entries)
-                {
-                    var elapsed = DateTime.UtcNow - entry.StartTime;
-                    var line = new Markup(
-                        $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(elapsed)}[/]");
-                    foreach (var seg in ((IRenderable)line).Render(options, maxWidth))
-                    {
-                        yield return seg;
-                    }
-                    yield return Segment.LineBreak;
-                }
-
-                var summary = new Markup($"[dim]{completed} done · {remaining} remaining[/]");
-                foreach (var seg in ((IRenderable)summary).Render(options, maxWidth))
-                {
-                    yield return seg;
-                }
-                yield return Segment.LineBreak;
-            }
+            internal PanelColumn(SpectreConsoleProgress owner) => _owner = owner;
+            public override IRenderable Render(RenderOptions options, ProgressTask task, TimeSpan deltaTime)
+                => _owner.BuildRenderable();
         }
     }
 }
