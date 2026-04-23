@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Spectre.Console;
@@ -12,13 +13,12 @@ namespace Strazh.Analysis
 {
     /// <summary>
     /// Implements <see cref="IAnalysisProgress"/> using Spectre.Console's Progress display.
-    /// A single <see cref="ProgressTask"/> is rendered by a custom <see cref="PanelColumn"/>
-    /// that rebuilds a multi-line <see cref="Rows"/> renderable on every frame, always showing
-    /// the most-recently-updated projects at the top and capping height to leave room for
-    /// completed-project lines in the terminal scrollback.
-    /// Completed and skipped lines are written via <see cref="AnsiConsole.MarkupLine"/>, which
-    /// Progress's render hook intercepts, clears the panel, writes the line to the scrollback,
-    /// and re-renders the panel below — leaving the terminal state clean.
+    /// Active tasks are sorted by most-recently-updated so that any task receiving a stage
+    /// change floats to the top of the visible area, even when more projects are in flight
+    /// than the terminal can display at once.
+    /// Completed and skipped lines are written via <see cref="AnsiConsole.MarkupLine"/>;
+    /// Progress's DefaultExclusivityMode render hook intercepts the call, clears the live area,
+    /// writes the line to the terminal scrollback, and re-renders below.
     /// All methods except <see cref="WrapAsync"/> may be called concurrently from multiple tasks.
     /// </summary>
     public sealed class SpectreConsoleProgress : IAnalysisProgress
@@ -56,6 +56,7 @@ namespace Strazh.Analysis
                         {
                             await Task.Delay(80).ConfigureAwait(false);
                             Interlocked.Increment(ref _tick);
+                            StripPadding(ctx);
                         }
                     });
                     try
@@ -165,8 +166,8 @@ namespace Strazh.Analysis
         private IRenderable BuildRenderable()
         {
             var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
-            // Cap at 3/4 terminal height (rounded down), leaving room for the optional
-            // "… N more" line and the summary line that always follow the project entries.
+            // Cap at 3/4 terminal height (rounded down), reserving 2 rows for the
+            // overflow line and summary line that follow the project entries.
             var maxContentRows = Math.Max(1, (int)(AnsiConsole.Console.Profile.Height * 3.0 / 4.0) - 2);
             var entries = _active.Values
                 .OrderByDescending(e => e.LastChanged)
@@ -191,22 +192,55 @@ namespace Strazh.Analysis
             return new Lines(rows);
         }
 
+        // DefaultProgressRenderer.Update() wraps the task grid in Padder(0, 1) every frame,
+        // adding one blank line above and below. We strip that padding after each tick so the
+        // progress panel sits flush against the completion lines above it.
+        private static readonly FieldInfo? _rendererField =
+            typeof(ProgressContext).GetField("_renderer", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly PropertyInfo? _paddingProperty =
+            typeof(Padder).GetProperty("Padding");
+
+        private static void StripPadding(ProgressContext ctx)
+        {
+            try
+            {
+                var renderer = _rendererField?.GetValue(ctx);
+                if (renderer == null) { return; }
+                var liveField = renderer.GetType().GetField("_live", BindingFlags.NonPublic | BindingFlags.Instance);
+                var live = liveField?.GetValue(renderer);
+                if (live == null) { return; }
+                var renderableField = live.GetType().GetField("_renderable", BindingFlags.NonPublic | BindingFlags.Instance);
+                var renderable = renderableField?.GetValue(live);
+                if (renderable is not Padder padder) { return; }
+                _paddingProperty?.SetValue(padder, new Padding(0));
+            }
+            catch
+            {
+                // If the Spectre.Console internals change, skip silently rather than crashing.
+            }
+        }
+
         private static string FormatElapsed(TimeSpan elapsed)
             => elapsed.TotalSeconds < 60
                 ? $"{elapsed.TotalSeconds:F1}s"
                 : $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s";
 
-        /// <summary>
-        /// Like <see cref="Rows"/> but omits the trailing line-break after the last child,
-        /// so Progress does not insert a blank line between completion output and the panel.
-        /// </summary>
+        private sealed class PanelColumn : ProgressColumn
+        {
+            private readonly SpectreConsoleProgress _owner;
+            internal PanelColumn(SpectreConsoleProgress owner) => _owner = owner;
+            public override IRenderable Render(RenderOptions options, ProgressTask task, TimeSpan deltaTime)
+                => _owner.BuildRenderable();
+        }
+
+        // Renders a list of IRenderable items, one per line, without a trailing LineBreak.
+        // (Spectre.Console's Rows appends LineBreak after every child including the last,
+        // which would produce an unwanted blank line at the bottom of the panel.)
         private sealed class Lines : IRenderable
         {
             private readonly IReadOnlyList<IRenderable> _rows;
             internal Lines(IReadOnlyList<IRenderable> rows) => _rows = rows;
-
             public Measurement Measure(RenderOptions options, int maxWidth) => new(0, maxWidth);
-
             public IEnumerable<Segment> Render(RenderOptions options, int maxWidth)
             {
                 for (var i = 0; i < _rows.Count; i++)
@@ -221,18 +255,6 @@ namespace Strazh.Analysis
                     }
                 }
             }
-        }
-
-        /// <summary>
-        /// Single-column renderer for the panel task. Returns a multi-line
-        /// <see cref="Lines"/> renderable so each active project appears on its own line.
-        /// </summary>
-        private sealed class PanelColumn : ProgressColumn
-        {
-            private readonly SpectreConsoleProgress _owner;
-            internal PanelColumn(SpectreConsoleProgress owner) => _owner = owner;
-            public override IRenderable Render(RenderOptions options, ProgressTask task, TimeSpan deltaTime)
-                => _owner.BuildRenderable();
         }
     }
 }
