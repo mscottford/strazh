@@ -165,8 +165,9 @@ namespace Strazh.Analysis
         private IRenderable BuildRenderable()
         {
             var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
-            // Reserve rows for completed-project lines so they remain visible above the panel.
-            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 5);
+            // Cap at 3/4 terminal height (rounded down), leaving room for the optional
+            // "… N more" line and the summary line that always follow the project entries.
+            var maxContentRows = Math.Max(1, (int)(AnsiConsole.Console.Profile.Height * 3.0 / 4.0) - 2);
             var entries = _active.Values
                 .OrderByDescending(e => e.LastChanged)
                 .Take(maxContentRows)
@@ -187,7 +188,7 @@ namespace Strazh.Analysis
                 rows.Add(new Markup($"[dim]  … {hidden} more running[/]"));
             }
             rows.Add(new Markup($"[dim]{completed} done · {remaining} remaining[/]"));
-            return new Rows(rows);
+            return new Lines(rows);
         }
 
         private static string FormatElapsed(TimeSpan elapsed)
@@ -196,8 +197,35 @@ namespace Strazh.Analysis
                 : $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:D2}s";
 
         /// <summary>
+        /// Like <see cref="Rows"/> but omits the trailing line-break after the last child,
+        /// so Progress does not insert a blank line between completion output and the panel.
+        /// </summary>
+        private sealed class Lines : IRenderable
+        {
+            private readonly IReadOnlyList<IRenderable> _rows;
+            internal Lines(IReadOnlyList<IRenderable> rows) => _rows = rows;
+
+            public Measurement Measure(RenderOptions options, int maxWidth) => new(0, maxWidth);
+
+            public IEnumerable<Segment> Render(RenderOptions options, int maxWidth)
+            {
+                for (var i = 0; i < _rows.Count; i++)
+                {
+                    foreach (var seg in ((IRenderable)_rows[i]).Render(options, maxWidth))
+                    {
+                        yield return seg;
+                    }
+                    if (i < _rows.Count - 1)
+                    {
+                        yield return Segment.LineBreak;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Single-column renderer for the panel task. Returns a multi-line
-        /// <see cref="Rows"/> renderable so each active project appears on its own line.
+        /// <see cref="Lines"/> renderable so each active project appears on its own line.
         /// </summary>
         private sealed class PanelColumn : ProgressColumn
         {
