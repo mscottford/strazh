@@ -747,6 +747,12 @@ namespace Strazh.Analysis
 
         // Builds all triples for a solution and its associated git repository for a
         // single project entry. Called once per project inside the parallel analysis tasks.
+        //
+        // Each project is attributed to its OWN git repository (which may be a submodule
+        // of the solution's repo), not the solution's. This keeps the graph stable across
+        // scans: scanning a submodule directly and scanning a host repo that includes it
+        // both produce identical Folder PKs and Repository associations for the submodule's
+        // contents, so a folder containing a submodule project is never tied to the host repo.
         private static IList<Triple> GetSolutionAndRepositoryTriples(
             IAnalyzerManager manager,
             (Project project, IAnalyzerResult result) entry)
@@ -760,37 +766,73 @@ namespace Strazh.Analysis
             var solutionNode = new SolutionNode(solutionName);
             triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
 
-            // Repository: find the git root, read the remote origin URL, and emit a
-            // Folder(repoShortName) -INCLUDED_IN-> Repository(owner/repo) triple so the
-            // graph is rooted at the repository rather than an arbitrary local path.
-            var repoName = GitHelper.GetRepositoryName(manager.SolutionFilePath);
-            if (repoName != null)
+            // Host repository root folder. Naming uses the natural repo name from origin
+            // (last segment of "owner/repo") rather than the local clone's directory
+            // basename, so PKs stay stable regardless of where the user cloned the repo.
+            var solutionRepoName = GitHelper.GetRepositoryName(manager.SolutionFilePath);
+            var solutionGitRoot = GitHelper.FindGitRoot(manager.SolutionFilePath);
+            var solutionRepoFolder = solutionRepoName != null
+                ? AttachRepoRoot(triples, solutionRepoName)
+                : null;
+
+            // Submodule mount points declared in the host repo's .gitmodules: a
+            // Folder(kind=Submodule) at "<host>/<mountPath>", INCLUDED_IN both the host's
+            // repo-root folder and the referenced Repository node.
+            if (solutionRepoFolder != null)
             {
-                var gitRoot = GitHelper.FindGitRoot(manager.SolutionFilePath);
-                var gitRootName = gitRoot != null
-                    ? Path.GetFileName(gitRoot)
-                    : repoName.Split('/').Last();
-                var repoRootFolderNode = new FolderNode(gitRootName, gitRootName);
-                var repoNode = new RepositoryNode(repoName);
-                triples.Add(new TripleIncludedIn(repoRootFolderNode, repoNode));
+                foreach (var sub in GitHelper.GetSubmodules(manager.SolutionFilePath))
+                {
+                    var mountPath = sub.MountPath.Replace('\\', '/');
+                    var mountFolder = new FolderNode(
+                        $"{solutionRepoFolder.Name}/{mountPath}",
+                        Path.GetFileName(mountPath),
+                        FolderKind.Submodule);
+                    triples.Add(new TripleIncludedIn(mountFolder, solutionRepoFolder));
+                    triples.Add(new TripleIncludedIn(mountFolder, new RepositoryNode(sub.RepositoryName)));
+                }
             }
 
-            // Connect the project's folder to the solution's root folder so the folder
-            // hierarchy is traversable from the solution downward. Without this triple,
-            // project folder nodes are orphans — present in the graph but unreachable
-            // from the solution folder via INCLUDED_IN traversal.
-            var projectRoot = entry.Item1.FilePath is { } fp ? GetRoot(fp) : null;
-            if (!string.IsNullOrEmpty(projectRoot) &&
-                !projectRoot.Equals(solutionRoot, StringComparison.OrdinalIgnoreCase))
+            // The project's own git root determines its repository. For a project living
+            // inside a submodule, this is the submodule's git root — not the solution's.
+            var projectPath = entry.Item1.FilePath;
+            var projectGitRoot = projectPath != null ? GitHelper.FindGitRoot(projectPath) : null;
+            var projectRepoName = projectPath != null ? GitHelper.GetRepositoryName(projectPath) : null;
+            var projectIsInSubmodule = projectGitRoot != null
+                && solutionGitRoot != null
+                && !projectGitRoot.Equals(solutionGitRoot, StringComparison.OrdinalIgnoreCase);
+
+            var projectRoot = projectPath != null ? GetRoot(projectPath) : null;
+            if (!string.IsNullOrEmpty(projectRoot))
             {
                 var projectRootNode = new FolderNode(projectRoot, projectRoot);
-                triples.Add(new TripleIncludedIn(projectRootNode, solutionRootNode));
+                // Submodule project → attach to its own repo's root folder. Host project →
+                // attach to the solution root (existing behavior). If we can't identify
+                // the submodule's repo, leave the folder un-attached rather than misattributing.
+                var parentFolder = projectIsInSubmodule
+                    ? (projectRepoName != null ? AttachRepoRoot(triples, projectRepoName) : null)
+                    : solutionRootNode;
+                if (parentFolder != null
+                    && !projectRoot.Equals(parentFolder.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    triples.Add(new TripleIncludedIn(projectRootNode, parentFolder));
+                }
             }
 
             var projectNode = new ProjectNode(GetProjectName(entry.Item1.Name));
             triples.Add(new TripleContains(solutionNode, projectNode));
 
             return triples;
+        }
+
+        // Emits Folder(<natural-repo-name>) -INCLUDED_IN-> Repository(<owner/repo>) and
+        // returns the folder. The folder name comes from the last segment of the repo
+        // name, so PKs are stable regardless of local clone directory naming.
+        private static FolderNode AttachRepoRoot(List<Triple> triples, string repoName)
+        {
+            var folderName = Path.GetFileName(repoName);
+            var folder = new FolderNode(folderName, folderName);
+            triples.Add(new TripleIncludedIn(folder, new RepositoryNode(repoName)));
+            return folder;
         }
 
         private static async Task<IList<Triple>> AnalyzeProject((Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
