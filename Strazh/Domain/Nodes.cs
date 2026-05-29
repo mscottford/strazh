@@ -104,9 +104,41 @@ namespace Strazh.Domain
         public override string Label { get; } = "File";
     }
 
-    public class FolderNode(string fullName, string name) : Node(fullName, name)
+    public enum FolderKind
     {
+        Regular,
+        Submodule,
+    }
+
+    public class FolderNode : Node
+    {
+        public FolderNode(string fullName, string name)
+            : this(fullName, name, FolderKind.Regular) { }
+
+        public FolderNode(string fullName, string name, FolderKind kind)
+            : base(fullName, name)
+        {
+            Kind = kind;
+            SetPrimaryKey();
+        }
+
         public override string Label { get; } = "Folder";
+
+        public FolderKind Kind { get; }
+
+        // Kind is part of the PK so two folders at the same path with different kinds
+        // (e.g. a Regular folder created by the file chain vs. a Submodule mount-point
+        // node) are distinct nodes in the graph rather than colliding on MERGE.
+        protected override void SetPrimaryKey()
+        {
+            Pk = DeterministicHash($"{FullName}|{Kind}");
+        }
+
+        // Only write kind when non-default to keep the property set clean on regular folders.
+        public override string Set(string node)
+            => Kind == FolderKind.Regular
+                ? base.Set(node)
+                : $"{base.Set(node)}, {node}.kind = \"{Kind}\"";
     }
 
     public class SolutionNode(string name) : Node(name, name)
