@@ -146,12 +146,32 @@ namespace Strazh.Domain
         public override string Label => "Solution";
     }
 
-    public class ProjectNode(string fullName, string name) : Node(fullName, name)
+    public class ProjectNode : Node
     {
+        public ProjectNode(string fullName, string name, string[] targetFrameworks = null)
+            : base(fullName, name)
+        {
+            TargetFrameworks = (targetFrameworks ?? Array.Empty<string>())
+                .Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().ToArray();
+        }
+
         public ProjectNode(string name)
             : this(name, name) { }
 
         public override string Label { get; } = "Project";
+
+        /// <summary>Target framework(s) the project builds for (e.g. net6.0, netstandard2.0).
+        /// Stored on the node as a native Neo4j list of strings.</summary>
+        public string[] TargetFrameworks { get; }
+
+        // Emit only when the frameworks are known: a project also appears as a reference
+        // target (created without TFMs), and those MERGEs must not clobber the value set
+        // from the project's own analysis. Written as a Neo4j list literal, e.g.
+        // n.targetFrameworks = ["net6.0", "netstandard2.0"].
+        public override string Set(string node)
+            => TargetFrameworks.Length == 0
+                ? base.Set(node)
+                : $"{base.Set(node)}, {node}.targetFrameworks = [{string.Join(", ", TargetFrameworks.Select(t => $"\"{t}\""))}]";
     }
 
     public class RepositoryNode(string name) : Node(name, name)

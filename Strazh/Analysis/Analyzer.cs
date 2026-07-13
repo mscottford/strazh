@@ -844,7 +844,17 @@ namespace Strazh.Analysis
             var triples = new List<Triple>();
             if (mode == Tiers.All || mode == Tiers.Project)
             {
-                var projectNode = new ProjectNode(projectName);
+                // Record the project's full target-framework set (from the static project
+                // file, so multi-targeted projects capture every TFM even though this method
+                // runs once per TFM result). Fall back to the single result TFM if needed.
+                var targetFrameworks = item.projectAnalyzerResult.Analyzer?.ProjectFile?.TargetFrameworks;
+                if (targetFrameworks == null || targetFrameworks.Length == 0)
+                {
+                    targetFrameworks = string.IsNullOrEmpty(item.projectAnalyzerResult.TargetFramework)
+                        ? Array.Empty<string>()
+                        : new[] { item.projectAnalyzerResult.TargetFramework };
+                }
+                var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
                 triples.Add(new TripleIncludedIn(projectNode, rootNode));
                 item.projectAnalyzerResult.ProjectReferences.ToList().ForEach(x =>
                 {
