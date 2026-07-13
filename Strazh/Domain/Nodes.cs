@@ -146,12 +146,38 @@ namespace Strazh.Domain
         public override string Label => "Solution";
     }
 
-    public class ProjectNode(string fullName, string name) : Node(fullName, name)
+    public class ProjectNode(string fullName, string name, string[] targetFrameworks = null, bool exists = true)
+        : Node(fullName, name)
     {
         public ProjectNode(string name)
             : this(name, name) { }
 
         public override string Label { get; } = "Project";
+
+        /// <summary>Target framework(s) the project builds for, stored as a native Neo4j list.</summary>
+        public string[] TargetFrameworks { get; } =
+            (targetFrameworks ?? Array.Empty<string>()).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().ToArray();
+
+        /// <summary>False when the project's .csproj does not exist on disk (a dangling reference).</summary>
+        public bool Exists { get; } = exists;
+
+        // targetFrameworks is emitted only when known (a project also appears as a reference
+        // target created without TFMs, and those MERGEs must not clobber the analyzed value).
+        // exists is emitted only when false, flagging dangling references without adding a
+        // property to every normal project.
+        public override string Set(string node)
+        {
+            var set = base.Set(node);
+            if (TargetFrameworks.Length > 0)
+            {
+                set += $", {node}.targetFrameworks = [{string.Join(", ", TargetFrameworks.Select(t => $"\"{t}\""))}]";
+            }
+            if (!Exists)
+            {
+                set += $", {node}.exists = false";
+            }
+            return set;
+        }
     }
 
     public class RepositoryNode(string name) : Node(name, name)
