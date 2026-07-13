@@ -277,7 +277,28 @@ namespace Strazh.Analysis
                     // AddToWorkspace with addProjectReferences: true eagerly adds referenced projects
                     // into the workspace. Those will be picked up via existingProject on their own
                     // iteration below.
-                    var project = primaryResult.AddToWorkspace(workspace, true);
+                    Project? project;
+                    try
+                    {
+                        project = primaryResult.AddToWorkspace(workspace, true);
+                    }
+                    catch (Exception)
+                    {
+                        // AddToWorkspace adds this project to the workspace, then eagerly resolves its
+                        // <ProjectReference>s; a reference to a file not on disk (a dangling/stale
+                        // reference) makes that resolution throw AFTER the project itself is already
+                        // added. Recover the already-added project so it still lands in the graph — its
+                        // Project-tier triples (target frameworks, package/project references) come from
+                        // the IAnalyzerResult and its own source stays analyzable; only the workspace's
+                        // resolved reference links (which strazh does not use to build triples) are lost.
+                        project = workspace.CurrentSolution.Projects
+                            .FirstOrDefault(p => p.FilePath == primaryResult.ProjectFilePath);
+                        if (project is null)
+                        {
+                            options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "could not load into workspace");
+                            continue;
+                        }
+                    }
                     if (project is null)
                     {
                         // AddToWorkspace returns null for project types not supported by Roslyn
@@ -844,11 +865,27 @@ namespace Strazh.Analysis
             var triples = new List<Triple>();
             if (mode == Tiers.All || mode == Tiers.Project)
             {
-                var projectNode = new ProjectNode(projectName);
+                // Record the project's full target-framework set. Read it from the static project
+                // file (via the analyzer, falling back to the manager) rather than the build result:
+                // IAnalyzerResult.TargetFramework is empty on binlog cache replays, whereas the
+                // project file is parsed the same way on fresh and replayed runs. Fall back to the
+                // single result TFM only if the project file yields nothing.
+                var analyzer = item.projectAnalyzerResult.Analyzer
+                    ?? item.projectAnalyzerResult.Manager?.GetProject(item.projectAnalyzerResult.ProjectFilePath);
+                var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
+                if (targetFrameworks.Length == 0 && !string.IsNullOrEmpty(item.projectAnalyzerResult.TargetFramework))
+                {
+                    targetFrameworks = new[] { item.projectAnalyzerResult.TargetFramework };
+                }
+
+                var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
                 triples.Add(new TripleIncludedIn(projectNode, rootNode));
                 item.projectAnalyzerResult.ProjectReferences.ToList().ForEach(x =>
                 {
-                    var node = new ProjectNode(GetProjectName(x));
+                    // Flag references whose .csproj is not on disk (dangling/stale) so the graph
+                    // represents non-existent projects rather than silently dropping the edge.
+                    var refName = GetProjectName(x);
+                    var node = new ProjectNode(refName, refName, null, File.Exists(x));
                     triples.Add(new TripleDependsOnProject(projectNode, node));
                 });
                 item.projectAnalyzerResult.PackageReferences.ToList().ForEach(x =>
