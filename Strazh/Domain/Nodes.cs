@@ -146,7 +146,7 @@ namespace Strazh.Domain
         public override string Label => "Solution";
     }
 
-    public class ProjectNode(string fullName, string name, string[] targetFrameworks = null, bool exists = true)
+    public class ProjectNode(string fullName, string name, string[] targetFrameworks = null, bool exists = true, bool buildFailed = false)
         : Node(fullName, name)
     {
         public ProjectNode(string name)
@@ -161,10 +161,13 @@ namespace Strazh.Domain
         /// <summary>False when the project's .csproj does not exist on disk (a dangling reference).</summary>
         public bool Exists { get; } = exists;
 
+        /// <summary>True when the project was represented from a build that did not succeed
+        /// (its facts come from whatever Buildalyzer collected rather than a clean build).</summary>
+        public bool BuildFailed { get; } = buildFailed;
+
         // targetFrameworks is emitted only when known (a project also appears as a reference
         // target created without TFMs, and those MERGEs must not clobber the analyzed value).
-        // exists is emitted only when false, flagging dangling references without adding a
-        // property to every normal project.
+        // exists / buildFailed are emitted only when notable, so normal projects stay clean.
         public override string Set(string node)
         {
             var set = base.Set(node);
@@ -175,6 +178,10 @@ namespace Strazh.Domain
             if (!Exists)
             {
                 set += $", {node}.exists = false";
+            }
+            if (BuildFailed)
+            {
+                set += $", {node}.buildFailed = true";
             }
             return set;
         }

@@ -56,6 +56,10 @@ namespace Strazh.Analysis
             var semaphore = new SemaphoreSlim(Environment.ProcessorCount);
             var analysisTasks = new List<Task>();
 
+            // Project file paths that reached the stream (were built and loaded). Anything left out
+            // was dropped by the build pipeline and gets a static fallback node after the stream.
+            var emittedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             // Stream projects through the Build → Load pipeline and launch an Analyze + Insert
             // task for each one as soon as it becomes available, without waiting for all
             // projects to finish building and loading first.
@@ -75,6 +79,7 @@ namespace Strazh.Analysis
                 {
                     var capturedEntry = entry;
                     var projectPath = capturedEntry.Item2.ProjectFilePath;
+                    emittedPaths.Add(projectPath);
                     var projectDisplayName = GetProjectName(capturedEntry.Item1.Name);
 
                     progress.OnStageChanged(projectPath, projectDisplayName, "Analyzing");
@@ -120,6 +125,30 @@ namespace Strazh.Analysis
 
                 await Task.WhenAll(analysisTasks);
             });
+
+            // Fallback: any project the build pipeline dropped (build failed, binlog unreadable,
+            // timed out, unsupported, or unloadable) never reached the stream. Emit a minimal node
+            // for each from its static project file so no project is silently missing from the graph.
+            if (config.Tier == Tiers.All || config.Tier == Tiers.Project)
+            {
+                foreach (var analyzer in projectAnalyzers)
+                {
+                    try
+                    {
+                        if (emittedPaths.Contains(analyzer.ProjectFile.Path))
+                        {
+                            continue;
+                        }
+                        var triples = BuildProjectTriples(analyzer)
+                            .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
+                        await store.InsertAsync(triples);
+                    }
+                    catch
+                    {
+                        // The project file itself could not be read — nothing to record for it.
+                    }
+                }
+            }
 
             workspace.Dispose();
         }
@@ -858,47 +887,17 @@ namespace Strazh.Analysis
 
         private static async Task<IList<Triple>> AnalyzeProject((Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
         {
-            var root = GetRoot(item.project.FilePath);
-            var rootNode = new FolderNode(root, root);
-            var projectName = GetProjectName(item.project.Name);
-
             var triples = new List<Triple>();
             if (mode == Tiers.All || mode == Tiers.Project)
             {
-                // Record the project's full target-framework set. Read it from the static project
-                // file (via the analyzer, falling back to the manager) rather than the build result:
-                // IAnalyzerResult.TargetFramework is empty on binlog cache replays, whereas the
-                // project file is parsed the same way on fresh and replayed runs. Fall back to the
-                // single result TFM only if the project file yields nothing.
-                var analyzer = item.projectAnalyzerResult.Analyzer
-                    ?? item.projectAnalyzerResult.Manager?.GetProject(item.projectAnalyzerResult.ProjectFilePath);
-                var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
-                if (targetFrameworks.Length == 0 && !string.IsNullOrEmpty(item.projectAnalyzerResult.TargetFramework))
-                {
-                    targetFrameworks = new[] { item.projectAnalyzerResult.TargetFramework };
-                }
-
-                var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
-                triples.Add(new TripleIncludedIn(projectNode, rootNode));
-                item.projectAnalyzerResult.ProjectReferences.ToList().ForEach(x =>
-                {
-                    // Flag references whose .csproj is not on disk (dangling/stale) so the graph
-                    // represents non-existent projects rather than silently dropping the edge.
-                    var refName = GetProjectName(x);
-                    var node = new ProjectNode(refName, refName, null, File.Exists(x));
-                    triples.Add(new TripleDependsOnProject(projectNode, node));
-                });
-                item.projectAnalyzerResult.PackageReferences.ToList().ForEach(x =>
-                {
-                    var version = x.Value.Values.FirstOrDefault(x => x.Contains(".")) ?? "none";
-                    var node = new PackageNode(x.Key, x.Key, version);
-                    triples.Add(new TripleDependsOnPackage(projectNode, node));
-                });
+                triples.AddRange(BuildProjectTriples(item.projectAnalyzerResult));
             }
 
             if (item.project.SupportsCompilation
                 && (mode == Tiers.All || mode == Tiers.Code))
             {
+                var root = GetRoot(item.project.FilePath);
+                var rootNode = new FolderNode(root, root);
                 var compilation = await item.project.GetCompilationAsync();
                 var syntaxTreeRoot = compilation.SyntaxTrees.Where(x => !x.FilePath.Contains("obj"));
                 foreach (var st in syntaxTreeRoot)
@@ -911,7 +910,67 @@ namespace Strazh.Analysis
 
             return triples;
         }
+
+        // Builds the Project-tier triples (the project node, its folder, and its project/package
+        // dependency edges) purely from an IAnalyzerResult, so a project can be represented from
+        // whatever Buildalyzer collected even when its build did not succeed (Buildalyzer still
+        // reports target frameworks and references). Target frameworks come from the static project
+        // file (the result's analyzer, else the manager) — replay-proof, since
+        // IAnalyzerResult.TargetFramework is empty on binlog cache replays; the single result TFM is
+        // a last-resort fallback. Reference targets whose .csproj is missing are flagged exists=false,
+        // and a non-succeeded build marks the node buildFailed.
+        public static IList<Triple> BuildProjectTriples(IAnalyzerResult result)
+        {
+            var triples = new List<Triple>();
+            var path = result.ProjectFilePath;
+            var projectName = GetProjectName(path);
+            var root = GetRoot(path);
+            var rootNode = new FolderNode(root, root);
+
+            var analyzer = result.Analyzer ?? result.Manager?.GetProject(path);
+            var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
+            if (targetFrameworks.Length == 0 && !string.IsNullOrEmpty(result.TargetFramework))
+            {
+                targetFrameworks = new[] { result.TargetFramework };
+            }
+
+            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks, exists: true, buildFailed: !result.Succeeded);
+            triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            result.ProjectReferences.ToList().ForEach(x =>
+            {
+                var refName = GetProjectName(x);
+                triples.Add(new TripleDependsOnProject(projectNode, new ProjectNode(refName, refName, null, File.Exists(x))));
+            });
+            result.PackageReferences.ToList().ForEach(x =>
+            {
+                var version = x.Value.Values.FirstOrDefault(v => v.Contains(".")) ?? "none";
+                triples.Add(new TripleDependsOnPackage(projectNode, new PackageNode(x.Key, x.Key, version)));
+            });
+            return triples;
+        }
         
+        // Builds minimal Project-tier triples from a project's static project file, for a project the
+        // build pipeline dropped (no IAnalyzerResult — e.g. an unreadable binlog or a timed-out build).
+        // Buildalyzer still parses target frameworks and package references from the file; project
+        // references aren't available without a build. The node is flagged buildFailed.
+        public static IList<Triple> BuildProjectTriples(IProjectAnalyzer analyzer)
+        {
+            var projectFile = analyzer.ProjectFile;
+            var triples = new List<Triple>();
+            var projectName = GetProjectName(projectFile.Path);
+            var root = GetRoot(projectFile.Path);
+            var rootNode = new FolderNode(root, root);
+
+            var projectNode = new ProjectNode(projectName, projectName, projectFile.TargetFrameworks, exists: true, buildFailed: true);
+            triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            foreach (var package in projectFile.PackageReferences)
+            {
+                var version = string.IsNullOrEmpty(package.Version) ? "none" : package.Version;
+                triples.Add(new TripleDependsOnPackage(projectNode, new PackageNode(package.Name, package.Name, version)));
+            }
+            return triples;
+        }
+
         private static string GetSolutionName(string fullName)
             => fullName.Split(Path.DirectorySeparatorChar).Last().Replace(".sln", "");
 
