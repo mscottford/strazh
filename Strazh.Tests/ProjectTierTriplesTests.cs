@@ -75,6 +75,55 @@ public class ProjectTierTriplesTests
             t.NodeB is PackageNode pkg && pkg.Name == "Litmus.RemoteAccess.Client");
     }
 
+    // A project that built but could not be loaded into the Roslyn workspace (an unsupported
+    // project type, or — as with Core.Xmpp.SystemAndUtilityTests — a dangling project reference
+    // that breaks workspace resolution) is not a build failure: its succeeded result still
+    // carries target frameworks and references. It must be represented from that result, not
+    // flagged buildFailed, so its references (including dangling ones) are captured.
+    [Fact]
+    public void BuildDroppedProjectTriples_WithBuiltButNotLoadedResult_IsNotBuildFailedAndKeepsReferences()
+    {
+        var result = new FakeAnalyzerResult
+        {
+            ProjectFilePath = Path.Combine("repo", "Core.Xmpp.SystemAndUtilityTests", "Core.Xmpp.SystemAndUtilityTests.csproj"),
+            Succeeded = true,
+            TargetFramework = "net472",
+            ProjectReferences = new[]
+            {
+                Path.Combine("repo", "Core", "Core.Portable", "Core.Portable.csproj"),
+            },
+        };
+
+        var triples = Analyzer.BuildDroppedProjectTriples(analyzer: null, builtButNotLoadedResult: result);
+
+        var node = triples.Select(t => t.NodeA).OfType<ProjectNode>()
+            .FirstOrDefault(p => p.Name == "Core.Xmpp.SystemAndUtilityTests");
+        Assert.NotNull(node);
+        Assert.False(node.BuildFailed, "a project that built but failed to load is not a build failure");
+
+        var danglingRef = triples.Select(t => t.NodeB).OfType<ProjectNode>()
+            .FirstOrDefault(p => p.Name == "Core.Portable");
+        Assert.NotNull(danglingRef);
+        Assert.False(danglingRef.Exists, "a reference to a .csproj not on disk is a non-existent project");
+    }
+
+    // A project with no result at all (build failed, timed out, or an unreadable build log) has
+    // only its static project file to go on and is flagged buildFailed.
+    [Fact]
+    public void BuildDroppedProjectTriples_WithNoResult_IsBuildFailedFromStaticProjectFile()
+    {
+        var projectPath = Path.Combine(
+            GetRepoRoot(), "SystemUnderTest", "Strazh.Tests.ProjectA", "Strazh.Tests.ProjectA.csproj");
+        var analyzer = new AnalyzerManager().GetProject(projectPath);
+
+        var triples = Analyzer.BuildDroppedProjectTriples(analyzer, builtButNotLoadedResult: null);
+
+        var node = triples.Select(t => t.NodeA).OfType<ProjectNode>()
+            .FirstOrDefault(p => p.Name == "Strazh.Tests.ProjectA");
+        Assert.NotNull(node);
+        Assert.True(node.BuildFailed);
+    }
+
     // Minimal IAnalyzerResult stand-in: sets only the members BuildProjectTriples reads and
     // leaves the rest at harmless defaults (no analyzer/manager, so TFMs fall back to
     // TargetFramework).

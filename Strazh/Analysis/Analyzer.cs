@@ -57,8 +57,14 @@ namespace Strazh.Analysis
             var analysisTasks = new List<Task>();
 
             // Project file paths that reached the stream (were built and loaded). Anything left out
-            // was dropped by the build pipeline and gets a static fallback node after the stream.
+            // was dropped by the build pipeline and gets a fallback node after the stream.
             var emittedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Projects that built but could not be loaded into the workspace, keyed by project file
+            // path. These carry a succeeded result, so they are represented from it (with references,
+            // not flagged buildFailed) rather than from the static project file. Populated from the
+            // sequential Load-stage foreach below, so a plain dictionary is safe.
+            var builtButNotLoaded = new Dictionary<string, IAnalyzerResult>(StringComparer.OrdinalIgnoreCase);
 
             // Stream projects through the Build → Load pipeline and launch an Analyze + Insert
             // task for each one as soon as it becomes available, without waiting for all
@@ -71,7 +77,8 @@ namespace Strazh.Analysis
                         {
                             OnBuildStarted = (path, name, isCacheHit, buildLabel) => progress.OnBuildStarted(path, name, isCacheHit, buildLabel),
                             OnBuildCompleted = path => progress.OnBuildCompleted(path),
-                            OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason)
+                            OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason),
+                            OnProjectBuiltButNotLoaded = result => builtButNotLoaded[result.ProjectFilePath] = result
                         },
                         config.CacheDirectory,
                         config.NoCache,
@@ -126,9 +133,11 @@ namespace Strazh.Analysis
                 await Task.WhenAll(analysisTasks);
             });
 
-            // Fallback: any project the build pipeline dropped (build failed, binlog unreadable,
-            // timed out, unsupported, or unloadable) never reached the stream. Emit a minimal node
-            // for each from its static project file so no project is silently missing from the graph.
+            // Fallback: any project the build pipeline dropped never reached the stream. Represent
+            // each so no project is silently missing from the graph — from its succeeded result if
+            // it built but could not be loaded (references preserved, not flagged buildFailed), or
+            // from its static project file otherwise (build failed / timed out / unreadable log,
+            // flagged buildFailed).
             if (config.Tier == Tiers.All || config.Tier == Tiers.Project)
             {
                 foreach (var analyzer in projectAnalyzers)
@@ -139,7 +148,8 @@ namespace Strazh.Analysis
                         {
                             continue;
                         }
-                        var triples = BuildProjectTriples(analyzer)
+                        builtButNotLoaded.TryGetValue(analyzer.ProjectFile.Path, out var builtResult);
+                        var triples = BuildDroppedProjectTriples(analyzer, builtResult)
                             .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
                         await store.InsertAsync(triples);
                     }
@@ -195,6 +205,12 @@ namespace Strazh.Analysis
             public Action<string, string, bool, BuildStageLabel>? OnBuildStarted { get; init; }
             public Action<string>? OnBuildCompleted { get; init; }
             public Action<string, string, string>? OnProjectSkipped { get; init; }
+
+            // A project whose build succeeded but which could not be loaded into the Roslyn
+            // workspace (unsupported project type, or a dangling reference that breaks workspace
+            // resolution). Its result still carries Project-tier facts, so it is represented from
+            // the result rather than being dropped to the static fallback.
+            public Action<IAnalyzerResult>? OnProjectBuiltButNotLoaded { get; init; }
         }
 
         private readonly record struct AnalysisOptions(
@@ -324,6 +340,10 @@ namespace Strazh.Analysis
                             .FirstOrDefault(p => p.FilePath == primaryResult.ProjectFilePath);
                         if (project is null)
                         {
+                            // The build succeeded, so the result carries Project-tier facts (target
+                            // frameworks, package/project references) even though code analysis is
+                            // impossible without the workspace project. Represent it from the result.
+                            options.Callbacks.OnProjectBuiltButNotLoaded?.Invoke(primaryResult);
                             options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "could not load into workspace");
                             continue;
                         }
@@ -331,7 +351,9 @@ namespace Strazh.Analysis
                     if (project is null)
                     {
                         // AddToWorkspace returns null for project types not supported by Roslyn
-                        // (e.g. F# projects, native projects). Skip them — they cannot be analyzed.
+                        // (e.g. F# projects, native projects). The build still succeeded, so
+                        // represent the project from its result before skipping code analysis.
+                        options.Callbacks.OnProjectBuiltButNotLoaded?.Invoke(primaryResult);
                         options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
                         continue;
                     }
@@ -974,6 +996,16 @@ namespace Strazh.Analysis
             }
             return triples;
         }
+
+        // Represents a project the streaming pipeline did not fully analyze. If the project built
+        // but could not be loaded into the workspace, its succeeded result is available and carries
+        // its references, so it is represented from that (and is not a build failure). Otherwise
+        // (build failed, timed out, or an unreadable build log) only the static project file remains,
+        // and the project is flagged buildFailed.
+        public static IList<Triple> BuildDroppedProjectTriples(IProjectAnalyzer analyzer, IAnalyzerResult builtButNotLoadedResult)
+            => builtButNotLoadedResult != null
+                ? BuildProjectTriples(builtButNotLoadedResult)
+                : BuildProjectTriples(analyzer);
 
         private static string GetSolutionName(string fullName)
             => fullName.Split(Path.DirectorySeparatorChar).Last().Replace(".sln", "");
