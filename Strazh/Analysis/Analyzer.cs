@@ -934,7 +934,11 @@ namespace Strazh.Analysis
                 targetFrameworks = new[] { result.TargetFramework };
             }
 
-            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks, exists: true, buildFailed: !result.Succeeded);
+            // buildFailed is not set from a single result: only succeeded results reach this path
+            // (RealTfmResults forwards only succeeded builds), and marking it here would mismark a
+            // multi-target project when one TFM fails but another succeeds. buildFailed is decided
+            // per project by the fallback sweep, which runs only when no build succeeded at all.
+            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
             triples.Add(new TripleIncludedIn(projectNode, rootNode));
             result.ProjectReferences.ToList().ForEach(x =>
             {

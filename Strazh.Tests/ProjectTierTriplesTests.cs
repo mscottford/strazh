@@ -64,7 +64,10 @@ public class ProjectTierTriplesTests
             .FirstOrDefault(p => p.Name == "Core.Apps.Rdp");
         Assert.NotNull(projectNode);
         Assert.Contains("net472", projectNode.TargetFrameworks);
-        Assert.True(projectNode.BuildFailed, "a non-succeeded build should be flagged buildFailed");
+        // buildFailed is a project-level fact (no TFM built) decided by the fallback sweep, not
+        // per individual result — so a single non-succeeded result must not flag it here, or a
+        // multi-target project with one failing TFM would be mismarked.
+        Assert.False(projectNode.BuildFailed);
 
         Assert.Contains(triples, t =>
             t.Relationship.Type == "DEPENDS_ON" && t.NodeB is ProjectNode p && p.Name == "Core");
