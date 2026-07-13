@@ -21,5 +21,6 @@ public class NullAnalysisProgress : IAnalysisProgress
     public void OnStageChanged(string projectFilePath, string projectName, string stage) { }
     public void OnProjectCompleted(string projectFilePath, int tripleCount) { }
     public void OnProjectSkipped(string projectFilePath, string filename, string reason) { }
+    public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed) { }
     public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples) { }
 }

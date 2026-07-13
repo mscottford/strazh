@@ -75,6 +75,14 @@ namespace Strazh.Analysis
             }
         }
 
+        public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
+        {
+            foreach (var impl in _implementations)
+            {
+                impl.OnProjectRecordedFromFallback(projectFilePath, filename, tripleCount, buildFailed);
+            }
+        }
+
         public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples)
         {
             foreach (var impl in _implementations)

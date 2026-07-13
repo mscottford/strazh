@@ -78,6 +78,21 @@ namespace Strazh.Analysis
         void OnProjectSkipped(string projectFilePath, string filename, string reason);
 
         /// <summary>
+        /// Raised when a project that could not be fully analyzed is still represented in the
+        /// graph from a fallback — its build result (built but not loadable into the workspace)
+        /// or its static project file (build failed / unreadable / timed out). Always follows the
+        /// matching <see cref="OnProjectSkipped"/>, so the earlier skip is not mistaken for data loss.
+        /// </summary>
+        /// <param name="projectFilePath">Absolute path to the project file.</param>
+        /// <param name="filename">Filename of the project (e.g. Core.Apps.Rdp.csproj).</param>
+        /// <param name="tripleCount">Number of triples recorded for it.</param>
+        /// <param name="buildFailed">
+        /// <c>true</c> when represented from the static project file because no build succeeded;
+        /// <c>false</c> when represented from a successful build result.
+        /// </param>
+        void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed);
+
+        /// <summary>
         /// Raised when triple deduplication (GroupBy) throws an exception.
         /// The implementation should surface the triple list for diagnosis.
         /// The pipeline will rethrow the exception after this method returns.

@@ -133,6 +133,14 @@ namespace Strazh.Analysis
             AnsiConsole.MarkupLine($"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})");
         }
 
+        public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
+        {
+            var note = buildFailed ? "build failed" : "not loaded into workspace";
+            AnsiConsole.MarkupLine(
+                $"  [dim]↳ recorded[/] {Markup.Escape(filename)} " +
+                $"[dim]({tripleCount} triples, {note})[/]");
+        }
+
         public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples)
         {
             AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");

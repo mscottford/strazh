@@ -152,6 +152,9 @@ namespace Strazh.Analysis
                         var triples = BuildDroppedProjectTriples(analyzer, builtResult)
                             .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
                         await store.InsertAsync(triples);
+                        progress.OnProjectRecordedFromFallback(
+                            analyzer.ProjectFile.Path, Path.GetFileName(analyzer.ProjectFile.Path),
+                            triples.Count, buildFailed: builtResult == null);
                     }
                     catch
                     {
