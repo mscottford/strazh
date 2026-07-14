@@ -84,6 +84,12 @@ namespace Strazh.Analysis
             Write("PROJECT_SKIPPED", $"file={Q(filename)} reason={Q(reason)} elapsed={FormatElapsed(elapsed)} path={Q(projectFilePath)}");
         }
 
+        public void OnProjectDeferred(string projectFilePath, string filename, string reason)
+        {
+            var elapsed = DateTime.UtcNow - GetStart(projectFilePath);
+            Write("PROJECT_DEFERRED", $"file={Q(filename)} reason={Q(reason)} elapsed={FormatElapsed(elapsed)} path={Q(projectFilePath)}");
+        }
+
         public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
         {
             Write("PROJECT_RECORDED_FALLBACK", $"file={Q(filename)} triples={tripleCount} buildFailed={buildFailed.ToString().ToLowerInvariant()} path={Q(projectFilePath)}");

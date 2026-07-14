@@ -77,7 +77,7 @@ namespace Strazh.Analysis
                         {
                             OnBuildStarted = (path, name, isCacheHit, buildLabel) => progress.OnBuildStarted(path, name, isCacheHit, buildLabel),
                             OnBuildCompleted = path => progress.OnBuildCompleted(path),
-                            OnProjectSkipped = (path, filename, reason) => progress.OnProjectSkipped(path, filename, reason),
+                            OnProjectDeferred = (path, filename, reason) => progress.OnProjectDeferred(path, filename, reason),
                             OnProjectBuiltButNotLoaded = result => builtButNotLoaded[result.ProjectFilePath] = result
                         },
                         config.CacheDirectory,
@@ -131,37 +131,51 @@ namespace Strazh.Analysis
                 }
 
                 await Task.WhenAll(analysisTasks);
-            });
 
-            // Fallback: any project the build pipeline dropped never reached the stream. Represent
-            // each so no project is silently missing from the graph — from its succeeded result if
-            // it built but could not be loaded (references preserved, not flagged buildFailed), or
-            // from its static project file otherwise (build failed / timed out / unreadable log,
-            // flagged buildFailed).
-            if (config.Tier == Tiers.All || config.Tier == Tiers.Project)
-            {
-                foreach (var analyzer in projectAnalyzers)
+                // Now drain the deferred queue: every project the stream dropped (build failed /
+                // timed out / unreadable log / not loadable) is still pending work in the display.
+                // Represent each so none is silently missing — from its succeeded result if it
+                // built but could not be loaded (references preserved, not flagged buildFailed), or
+                // from its static project file otherwise (flagged buildFailed). Running inside the
+                // progress scope keeps these visible as work being completed rather than lost.
+                if (config.Tier == Tiers.All || config.Tier == Tiers.Project)
                 {
-                    try
+                    foreach (var analyzer in projectAnalyzers)
                     {
-                        if (emittedPaths.Contains(analyzer.ProjectFile.Path))
+                        string path;
+                        try
+                        {
+                            path = analyzer.ProjectFile.Path;
+                        }
+                        catch
+                        {
+                            continue; // cannot even identify this project
+                        }
+                        if (emittedPaths.Contains(path))
                         {
                             continue;
                         }
-                        builtButNotLoaded.TryGetValue(analyzer.ProjectFile.Path, out var builtResult);
-                        var triples = BuildDroppedProjectTriples(analyzer, builtResult)
-                            .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
-                        await store.InsertAsync(triples);
-                        progress.OnProjectRecordedFromFallback(
-                            analyzer.ProjectFile.Path, Path.GetFileName(analyzer.ProjectFile.Path),
-                            triples.Count, buildFailed: builtResult == null);
-                    }
-                    catch
-                    {
-                        // The project file itself could not be read — nothing to record for it.
+
+                        var filename = Path.GetFileName(path);
+                        var displayName = GetProjectName(path);
+                        builtButNotLoaded.TryGetValue(path, out var builtResult);
+                        try
+                        {
+                            progress.OnStageChanged(path, displayName, "Recording");
+                            var triples = BuildDroppedProjectTriples(analyzer, builtResult)
+                                .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
+                            await store.InsertAsync(triples);
+                            progress.OnProjectRecordedFromFallback(path, filename, triples.Count, buildFailed: builtResult == null);
+                        }
+                        catch
+                        {
+                            // Even the fallback could not represent it (e.g. the project file
+                            // itself is unreadable) — report it as a genuine terminal skip.
+                            progress.OnProjectSkipped(path, filename, "could not be recorded from fallback");
+                        }
                     }
                 }
-            }
+            });
 
             workspace.Dispose();
         }
@@ -207,7 +221,10 @@ namespace Strazh.Analysis
         {
             public Action<string, string, bool, BuildStageLabel>? OnBuildStarted { get; init; }
             public Action<string>? OnBuildCompleted { get; init; }
-            public Action<string, string, string>? OnProjectSkipped { get; init; }
+            // A project that could not be analyzed normally (build failed / timed out / unreadable
+            // log / not loadable into the workspace). It is not terminal: the project stays pending
+            // work and is represented from fallback data after the stream.
+            public Action<string, string, string>? OnProjectDeferred { get; init; }
 
             // A project whose build succeeded but which could not be loaded into the Roslyn
             // workspace (unsupported project type, or a dangling reference that breaks workspace
@@ -347,7 +364,7 @@ namespace Strazh.Analysis
                             // frameworks, package/project references) even though code analysis is
                             // impossible without the workspace project. Represent it from the result.
                             options.Callbacks.OnProjectBuiltButNotLoaded?.Invoke(primaryResult);
-                            options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "could not load into workspace");
+                            options.Callbacks.OnProjectDeferred?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "could not load into workspace");
                             continue;
                         }
                     }
@@ -357,7 +374,7 @@ namespace Strazh.Analysis
                         // (e.g. F# projects, native projects). The build still succeeded, so
                         // represent the project from its result before skipping code analysis.
                         options.Callbacks.OnProjectBuiltButNotLoaded?.Invoke(primaryResult);
-                        options.Callbacks.OnProjectSkipped?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
+                        options.Callbacks.OnProjectDeferred?.Invoke(primaryResult.ProjectFilePath, Path.GetFileName(primaryResult.ProjectFilePath), "unsupported project type");
                         continue;
                     }
                     var patchedGroup = PatchProjectRefsFromWorkspace(tfmGroup, project, workspace);
@@ -603,7 +620,7 @@ namespace Strazh.Analysis
             }
             else
             {
-                stage.Callbacks.OnProjectSkipped?.Invoke(identity.Path, identity.FileName, reason);
+                stage.Callbacks.OnProjectDeferred?.Invoke(identity.Path, identity.FileName, reason);
             }
         }
 

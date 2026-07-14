@@ -75,6 +75,14 @@ namespace Strazh.Analysis
             }
         }
 
+        public void OnProjectDeferred(string projectFilePath, string filename, string reason)
+        {
+            foreach (var impl in _implementations)
+            {
+                impl.OnProjectDeferred(projectFilePath, filename, reason);
+            }
+        }
+
         public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
         {
             foreach (var impl in _implementations)
