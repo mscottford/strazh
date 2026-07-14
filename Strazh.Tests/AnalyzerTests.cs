@@ -4,6 +4,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Buildalyzer;
+using Buildalyzer.IO;
 using Strazh.Analysis;
 using Strazh.Domain;
 using Xunit;
@@ -27,7 +28,7 @@ public class AnalyzerTests
     public async Task GetAnalysisContext_IncludesProjectsAddedAsTransitiveReferences()
     {
         var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
-        var manager = new AnalyzerManager(solutionPath);
+        var manager = new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions());
 
         var context = await Analyzer.GetAnalysisContext(manager);
 
@@ -51,10 +52,10 @@ public class AnalyzerTests
         try
         {
             var cachedContext = await Analyzer.GetAnalysisContext(
-                new AnalyzerManager(solutionPath), cacheDir);
+                new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions()), cacheDir);
 
             var uncachedContext = await Analyzer.GetAnalysisContext(
-                new AnalyzerManager(solutionPath));
+                new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions()));
 
             AssertAnalysisContextsAreEquivalent(uncachedContext, cachedContext);
         }
@@ -79,14 +80,14 @@ public class AnalyzerTests
         try
         {
             // Populate the cache
-            await Analyzer.GetAnalysisContext(new AnalyzerManager(solutionPath), cacheDir);
+            await Analyzer.GetAnalysisContext(new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions()), cacheDir);
 
             // Replay from cache
             var cachedContext = await Analyzer.GetAnalysisContext(
-                new AnalyzerManager(solutionPath), cacheDir);
+                new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions()), cacheDir);
 
             var uncachedContext = await Analyzer.GetAnalysisContext(
-                new AnalyzerManager(solutionPath));
+                new AnalyzerManager(IOPath.Parse(solutionPath), new AnalyzerManagerOptions()));
 
             AssertAnalysisContextsAreEquivalent(uncachedContext, cachedContext);
         }

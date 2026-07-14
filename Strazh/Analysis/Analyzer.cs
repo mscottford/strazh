@@ -6,6 +6,7 @@ using Microsoft.CodeAnalysis;
 using Strazh.Domain;
 using Buildalyzer;
 using Buildalyzer.Environment;
+using Buildalyzer.IO;
 using Buildalyzer.Workspaces;
 using System.Collections.Generic;
 using System;
@@ -29,12 +30,12 @@ namespace Strazh.Analysis
             using var buildalyzerLog = TextWriter.Synchronized(new StreamWriter(buildalyzerLogPath, append: false));
             var managerOptions = new AnalyzerManagerOptions { LogWriter = buildalyzerLog };
             var manager = config.IsSolutionBased
-                ? new AnalyzerManager(config.Solution, managerOptions)
+                ? new AnalyzerManager(IOPath.Parse(config.Solution), managerOptions)
                 : new AnalyzerManager(managerOptions);
 
             var projectAnalyzers = (config.IsSolutionBased
                 ? manager.Projects.Values
-                : config.Projects.Select(x => manager.GetProject(x))).ToList();
+                : config.Projects.Select(x => manager.GetProject(IOPath.Parse(x)))).ToList();
 
             Console.WriteLine($"Analyzer ready to analyze {projectAnalyzers.Count} project/s.");
 
@@ -727,9 +728,9 @@ namespace Strazh.Analysis
         private static AdhocWorkspace CreateWorkspace(IAnalyzerManager manager)
         {
             var workspace = new AdhocWorkspace();
-            if (!string.IsNullOrEmpty(manager.SolutionFilePath))
+            if (manager.Solution is { } solution && solution.Path.HasValue)
             {
-                Microsoft.CodeAnalysis.SolutionInfo solutionInfo = Microsoft.CodeAnalysis.SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, manager.SolutionFilePath);
+                Microsoft.CodeAnalysis.SolutionInfo solutionInfo = Microsoft.CodeAnalysis.SolutionInfo.Create(SolutionId.CreateNewId(), VersionStamp.Default, solution.Path.ToString());
                 workspace.AddSolution(solutionInfo);
             }
             return workspace;
@@ -851,18 +852,21 @@ namespace Strazh.Analysis
         {
             var triples = new List<Triple>();
 
-            var solutionRoot = GetRoot(manager.SolutionFilePath);
+            // This method only runs for solution-based analysis, so Solution is non-null.
+            var solutionFilePath = manager.Solution!.Path.ToString();
+
+            var solutionRoot = GetRoot(solutionFilePath);
             var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
 
-            var solutionName = GetSolutionName(manager.SolutionFilePath);
+            var solutionName = GetSolutionName(solutionFilePath);
             var solutionNode = new SolutionNode(solutionName);
             triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
 
             // Host repository root folder. Naming uses the natural repo name from origin
             // (last segment of "owner/repo") rather than the local clone's directory
             // basename, so PKs stay stable regardless of where the user cloned the repo.
-            var solutionRepoName = GitHelper.GetRepositoryName(manager.SolutionFilePath);
-            var solutionGitRoot = GitHelper.FindGitRoot(manager.SolutionFilePath);
+            var solutionRepoName = GitHelper.GetRepositoryName(solutionFilePath);
+            var solutionGitRoot = GitHelper.FindGitRoot(solutionFilePath);
             var solutionRepoFolder = solutionRepoName != null
                 ? AttachRepoRoot(triples, solutionRepoName)
                 : null;
@@ -872,7 +876,7 @@ namespace Strazh.Analysis
             // repo-root folder and the referenced Repository node.
             if (solutionRepoFolder != null)
             {
-                foreach (var sub in GitHelper.GetSubmodules(manager.SolutionFilePath))
+                foreach (var sub in GitHelper.GetSubmodules(solutionFilePath))
                 {
                     var mountPath = sub.MountPath.Replace('\\', '/');
                     var mountFolder = new FolderNode(
@@ -941,12 +945,15 @@ namespace Strazh.Analysis
                 var root = GetRoot(item.project.FilePath);
                 var rootNode = new FolderNode(root, root);
                 var compilation = await item.project.GetCompilationAsync();
-                var syntaxTreeRoot = compilation.SyntaxTrees.Where(x => !x.FilePath.Contains("obj"));
-                foreach (var st in syntaxTreeRoot)
+                if (compilation != null)
                 {
-                    var sem = compilation.GetSemanticModel(st);
-                    Extractor.AnalyzeTree<InterfaceDeclarationSyntax>(triples, st, sem, rootNode);
-                    Extractor.AnalyzeTree<ClassDeclarationSyntax>(triples, st, sem, rootNode);
+                    var syntaxTreeRoot = compilation.SyntaxTrees.Where(x => !x.FilePath.Contains("obj"));
+                    foreach (var st in syntaxTreeRoot)
+                    {
+                        var sem = compilation.GetSemanticModel(st);
+                        Extractor.AnalyzeTree<InterfaceDeclarationSyntax>(triples, st, sem, rootNode);
+                        Extractor.AnalyzeTree<ClassDeclarationSyntax>(triples, st, sem, rootNode);
+                    }
                 }
             }
 
@@ -1033,8 +1040,8 @@ namespace Strazh.Analysis
         private static string GetProjectName(string fullName)
             => fullName.Split(Path.DirectorySeparatorChar).Last().Replace(".csproj", "");
 
-        private static string GetRoot(string filePath)
-            => filePath.Split(Path.DirectorySeparatorChar).Reverse().Skip(1).FirstOrDefault();
+        private static string GetRoot(string? filePath)
+            => (filePath ?? "").Split(Path.DirectorySeparatorChar).Reverse().Skip(1).FirstOrDefault() ?? "";
 
         // If any result in the group already has project references, the group is returned
         // unchanged. Otherwise, Roslyn's project reference graph (populated by AddToWorkspace)
@@ -1068,7 +1075,7 @@ namespace Strazh.Analysis
             public IEnumerable<string> ProjectReferences => projectReferences;
 
             // All other members delegate to the wrapped result.
-            public ProjectAnalyzer? Analyzer => inner.Analyzer;
+            public ProjectAnalyzer Analyzer => inner.Analyzer;
             public IReadOnlyDictionary<string, IProjectItem[]> Items => inner.Items;
             public AnalyzerManager Manager => inner.Manager;
             public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> PackageReferences => inner.PackageReferences;
@@ -1086,7 +1093,7 @@ namespace Strazh.Analysis
             public string Command => inner.Command;
             public string CompilerFilePath => inner.CompilerFilePath;
             public string[] CompilerArguments => inner.CompilerArguments;
-            public string? GetProperty(string name) => inner.GetProperty(name);
+            public string GetProperty(string name) => inner.GetProperty(name);
         }
     }
 }

@@ -8,11 +8,11 @@ namespace Strazh.Analysis
     {
         public class CredentialsConfig
         {
-            public string Database { get; }
-            public string User { get; }
-            public string Password { get; }
+            public string Database { get; } = "";
+            public string User { get; } = "";
+            public string Password { get; } = "";
 
-            public CredentialsConfig(string credentials)
+            public CredentialsConfig(string? credentials)
             {
                 if (!string.IsNullOrEmpty(credentials))
                 {
@@ -35,11 +35,11 @@ namespace Strazh.Analysis
         }
 
         public record Options(
-            string Credentials,
-            string Tier,
-            string Delete,
-            string Solution,
-            string[] Projects,
+            string? Credentials,
+            string? Tier,
+            string? Delete,
+            string? Solution,
+            string[]? Projects,
             string? CacheDirectory = null,
             bool NoCache = false,
             string? BuildLogDirectory = null,
@@ -51,9 +51,9 @@ namespace Strazh.Analysis
         public string Solution { get; }
         public string[] Projects { get; }
         public bool IsDelete { get; }
-        public string? CacheDirectory { get; }
+        public string CacheDirectory { get; }
         public bool NoCache { get; }
-        public string? BuildLogDirectory { get; }
+        public string BuildLogDirectory { get; }
         public string Neo4jUrl { get; }
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
@@ -67,7 +67,7 @@ namespace Strazh.Analysis
             Credentials = new CredentialsConfig(options.Credentials);
             Tier = MapTier(options.Tier);
             IsDelete = options.Delete != "false";
-            Solution = string.IsNullOrEmpty(solution) ? solution : Path.GetFullPath(solution);
+            Solution = string.IsNullOrEmpty(solution) ? "" : Path.GetFullPath(solution);
             Projects = (options.Projects ?? Array.Empty<string>())
                 .Select(Path.GetFullPath)
                 .ToArray();
@@ -95,7 +95,7 @@ namespace Strazh.Analysis
             Neo4jUrl = string.IsNullOrEmpty(options.Neo4jUrl) ? "neo4j://localhost:7687" : options.Neo4jUrl;
         }
 
-        private Tiers MapTier(string mode)
+        private Tiers MapTier(string? mode)
             => (mode ?? "").ToLowerInvariant() switch
                 {
                     "project" => Tiers.Project,

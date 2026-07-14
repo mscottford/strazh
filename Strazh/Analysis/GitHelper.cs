@@ -92,34 +92,63 @@ namespace Strazh.Analysis
             return results;
         }
 
-        // Resolves the directory holding the real git metadata (config, HEAD, etc.) for the
-        // repository rooted at gitRoot. For a regular repo this is <gitRoot>/.git. For a
+        // Resolves the directory holding the shared git metadata (config in particular) for
+        // the repository rooted at gitRoot. For a regular repo this is <gitRoot>/.git. For a
         // submodule checkout, .git is a file containing "gitdir: <relative-path>" pointing
-        // into the parent's .git/modules/<name>/ directory.
+        // into the parent's .git/modules/<name>/ directory. For a linked worktree, .git is a
+        // file pointing at a per-worktree gitdir that holds only HEAD/index and a "commondir"
+        // pointer back to the shared .git directory — that shared directory is followed so
+        // config (and thus origin) is found.
         private static string? ResolveGitDir(string gitRoot)
         {
             var gitPath = Path.Combine(gitRoot, ".git");
+            string gitDir;
             if (Directory.Exists(gitPath))
             {
-                return gitPath;
+                gitDir = gitPath;
             }
-            if (!File.Exists(gitPath))
+            else if (File.Exists(gitPath))
+            {
+                var content = File.ReadAllText(gitPath).Trim();
+                const string prefix = "gitdir:";
+                if (!content.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    return null;
+                }
+                var target = content[prefix.Length..].Trim();
+                if (!Path.IsPathRooted(target))
+                {
+                    target = Path.GetFullPath(Path.Combine(gitRoot, target));
+                }
+                if (!Directory.Exists(target))
+                {
+                    return null;
+                }
+                gitDir = target;
+            }
+            else
             {
                 return null;
             }
 
-            var content = File.ReadAllText(gitPath).Trim();
-            const string prefix = "gitdir:";
-            if (!content.StartsWith(prefix, StringComparison.Ordinal))
+            // A linked worktree's gitdir shares config/objects/refs with the main repo via a
+            // "commondir" pointer (relative to the gitdir when not absolute). Follow it so
+            // config lookups resolve to the shared directory rather than the worktree's own.
+            var commonDirFile = Path.Combine(gitDir, "commondir");
+            if (File.Exists(commonDirFile))
             {
-                return null;
+                var commonDir = File.ReadAllText(commonDirFile).Trim();
+                if (!Path.IsPathRooted(commonDir))
+                {
+                    commonDir = Path.GetFullPath(Path.Combine(gitDir, commonDir));
+                }
+                if (Directory.Exists(commonDir))
+                {
+                    gitDir = commonDir;
+                }
             }
-            var target = content[prefix.Length..].Trim();
-            if (!Path.IsPathRooted(target))
-            {
-                target = Path.GetFullPath(Path.Combine(gitRoot, target));
-            }
-            return Directory.Exists(target) ? target : null;
+
+            return gitDir;
         }
 
         private static string? ReadOriginUrl(string gitRoot)
