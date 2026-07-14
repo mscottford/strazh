@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Buildalyzer;
 using Buildalyzer.IO;
@@ -288,6 +289,66 @@ public class AnalyzerTests
                 {
                     try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// End-to-end check that a real analysis emits a per-project metrics report — the same
+    /// pipeline the CLI runs, so the Load-stage timings are real rather than scripted. Confirms
+    /// the report has a line per analyzed project with per-stage timings.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_WritesPerProjectMetricsReport()
+    {
+        var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-log-{Guid.NewGuid():N}");
+        var metricsPath = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: solutionPath,
+                Projects: Array.Empty<string>(),
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            await Analyzer.Analyze(config, new MetricsAnalysisProgress(metricsPath), new InMemoryTripleStore());
+
+            Assert.True(File.Exists(metricsPath), "metrics report should be written");
+            var lines = await File.ReadAllLinesAsync(metricsPath);
+            Assert.NotEmpty(lines);
+
+            // At least one analyzed project reports per-stage timings and a completed outcome.
+            var sawCompletedWithStages = false;
+            foreach (var line in lines)
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                Assert.False(string.IsNullOrEmpty(root.GetProperty("name").GetString()));
+                if (root.GetProperty("outcome").GetString() == "completed"
+                    && root.GetProperty("stagesMs").EnumerateObject().Any())
+                {
+                    sawCompletedWithStages = true;
+                }
+            }
+            Assert.True(sawCompletedWithStages, "expected at least one completed project with stage timings");
+        }
+        finally
+        {
+            foreach (var dir in new[] { cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+            if (File.Exists(metricsPath))
+            {
+                File.Delete(metricsPath);
             }
         }
     }

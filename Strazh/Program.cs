@@ -114,11 +114,14 @@ namespace Strazh
                 }
 
                 Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
-                var runLogPath = Path.Combine(
-                    config.BuildLogDirectory,
-                    $"strazh-run-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
+                var timestamp = $"{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}";
+                var runLogPath = Path.Combine(config.BuildLogDirectory, $"strazh-run-{timestamp}.log");
+                var metricsPath = Path.Combine(config.BuildLogDirectory, $"strazh-metrics-{timestamp}.jsonl");
                 using var fileProgress = new FileAnalysisProgress(runLogPath);
-                var progress = new CompositeAnalysisProgress(new SpectreConsoleProgress(), fileProgress);
+                var progress = new CompositeAnalysisProgress(
+                    new SpectreConsoleProgress(),
+                    fileProgress,
+                    new MetricsAnalysisProgress(metricsPath));
                 var store = new Neo4jTripleStore(config.Credentials, config.Neo4jUrl);
                 await Analyzer.Analyze(config, progress, store);
                 Console.WriteLine("Code Knowledge Graph created.");

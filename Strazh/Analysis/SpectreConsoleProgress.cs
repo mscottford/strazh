@@ -36,6 +36,7 @@ namespace Strazh.Analysis
         private int _tick;
         private int _total;
         private int _completed;
+        private DateTime _runStart = DateTime.UtcNow;
 
         private static readonly string[] SpinnerFrames =
             ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -43,6 +44,7 @@ namespace Strazh.Analysis
         public async Task WrapAsync(int totalProjects, Func<Task> action)
         {
             _total = totalProjects;
+            _runStart = DateTime.UtcNow;
             await AnsiConsole.Progress()
                 .AutoClear(true)
                 .Columns(new PanelColumn(this))
@@ -89,7 +91,11 @@ namespace Strazh.Analysis
             }
             else
             {
-                UpdateEntry(projectFilePath, "Loading");
+                // The build finished, but the sequential Load stage may not reach this project
+                // for a while (it can't start until every build completes). Mark it "Waiting"
+                // rather than "Loading" so a queued project is not shown as actively loading —
+                // OnLoadStarted flips it to "Loading" when AddToWorkspace actually begins.
+                UpdateEntry(projectFilePath, "Waiting");
             }
         }
 
@@ -186,28 +192,45 @@ namespace Strazh.Analysis
         private IRenderable BuildRenderable()
         {
             var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
+            var now = DateTime.UtcNow;
+
+            // "Waiting" projects have finished building and are queued for the sequential Load
+            // stage — they are idle, not working. Collapsing them into a single count keeps the
+            // genuinely-active projects (building/loading/analyzing/…) visible and moving, instead
+            // of dozens of identical "Waiting" lines that look frozen.
+            var all = _active.Values.ToList();
+            var waiting = all.Count(e => e.Stage == "Waiting");
             // Reserve rows for completed-project lines so they remain visible above the panel.
-            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 5);
-            var entries = _active.Values
+            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 6);
+            var active = all
+                .Where(e => e.Stage != "Waiting")
                 .OrderByDescending(e => e.LastChanged)
                 .Take(maxContentRows)
                 .ToList();
-            var hidden = Math.Max(0, _active.Count - entries.Count);
+            var hiddenActive = Math.Max(0, (all.Count - waiting) - active.Count);
             var completed = Volatile.Read(ref _completed);
             var remaining = Math.Max(0, _total - completed);
 
-            var rows = new List<IRenderable>(entries.Count + 2);
-            foreach (var entry in entries)
+            var rows = new List<IRenderable>(active.Count + 3);
+            foreach (var entry in active)
             {
-                var elapsed = DateTime.UtcNow - entry.StartTime;
+                // Time in the current stage makes progress legible: a project that just moved to
+                // a stage shows a small, growing number rather than its whole-run elapsed.
+                var stageElapsed = now - entry.LastChanged;
                 rows.Add(new Markup(
-                    $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(elapsed)}[/]"));
+                    $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(stageElapsed)}[/]"));
             }
-            if (hidden > 0)
+            if (hiddenActive > 0)
             {
-                rows.Add(new Markup($"[dim]  … {hidden} more running[/]"));
+                rows.Add(new Markup($"[dim]  … {hiddenActive} more active[/]"));
             }
-            rows.Add(new Markup($"[dim]{completed} done · {remaining} remaining[/]"));
+            if (waiting > 0)
+            {
+                rows.Add(new Markup($"[dim]  {waiting} built, waiting to load[/]"));
+            }
+            var pct = _total > 0 ? (int)(100.0 * completed / _total) : 0;
+            rows.Add(new Markup(
+                $"[dim]{completed}/{_total} done ({pct}%) · {remaining} remaining · {FormatElapsed(now - _runStart)} elapsed[/]"));
             return new Rows(rows);
         }
 

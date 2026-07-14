@@ -98,6 +98,7 @@ namespace Strazh.Analysis
                         {
                             OnBuildStarted = (path, name, isCacheHit, buildLabel) => progress.OnBuildStarted(path, name, isCacheHit, buildLabel),
                             OnBuildCompleted = path => progress.OnBuildCompleted(path),
+                            OnLoadStarted = path => progress.OnStageChanged(path, GetProjectName(path), "Loading"),
                             OnProjectDeferred = (path, filename, reason) => progress.OnProjectDeferred(path, filename, reason),
                             OnProjectBuiltButNotLoaded = result => builtButNotLoaded[result.ProjectFilePath] = result
                         },
@@ -341,6 +342,12 @@ namespace Strazh.Analysis
         {
             public Action<string, string, bool, BuildStageLabel>? OnBuildStarted { get; init; }
             public Action<string>? OnBuildCompleted { get; init; }
+
+            // Raised when the Load stage actually begins adding a project to the Roslyn workspace,
+            // as opposed to the project merely sitting built-and-queued. Lets progress separate
+            // real load time (AddToWorkspace, which is sequential and can trigger inline builds)
+            // from the queue wait after its build finished.
+            public Action<string>? OnLoadStarted { get; init; }
             // A project that could not be analyzed normally (build failed / timed out / unreadable
             // log / not loadable into the workspace). It is not terminal: the project stays pending
             // work and is represented from fallback data after the stream.
@@ -454,6 +461,7 @@ namespace Strazh.Analysis
             foreach (var tfmGroup in TopologicalSort(results))
             {
                 var primaryResult = tfmGroup.First(r => r.Succeeded);
+                options.Callbacks.OnLoadStarted?.Invoke(primaryResult.ProjectFilePath);
 
                 var existingProject = workspace.CurrentSolution.Projects
                     .FirstOrDefault(p => p.FilePath == primaryResult.ProjectFilePath);
