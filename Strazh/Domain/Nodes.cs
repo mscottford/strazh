@@ -16,7 +16,7 @@ namespace Strazh.Domain
         /// <summary>
         /// Primary Key used to compare Matching of nodes on MERGE operation
         /// </summary>
-        public virtual string Pk { get; protected set; }
+        public virtual string Pk { get; protected set; } = "";
 
         public Node(string fullName, string name)
         {
@@ -49,7 +49,7 @@ namespace Strazh.Domain
 
     // Code
 
-    public abstract class CodeNode(string fullName, string name, string[] modifiers = null) : Node(fullName, name)
+    public abstract class CodeNode(string fullName, string name, string[]? modifiers = null) : Node(fullName, name)
     {
         public string Modifiers { get; } = modifiers == null ? "" : string.Join(", ", modifiers);
 
@@ -57,16 +57,16 @@ namespace Strazh.Domain
             => $"{base.Set(node)}{(string.IsNullOrEmpty(Modifiers) ? "" : $", {node}.modifiers = \"{Modifiers}\"")}";
     }
 
-    public abstract class TypeNode(string fullName, string name, string[] modifiers = null)
+    public abstract class TypeNode(string fullName, string name, string[]? modifiers = null)
         : CodeNode(fullName, name, modifiers);
 
-    public class ClassNode(string fullName, string name, string[] modifiers = null)
+    public class ClassNode(string fullName, string name, string[]? modifiers = null)
         : TypeNode(fullName, name, modifiers)
     {
         public override string Label { get; } = "Class";
     }
 
-    public class InterfaceNode(string fullName, string name, string[] modifiers = null)
+    public class InterfaceNode(string fullName, string name, string[]? modifiers = null)
         : TypeNode(fullName, name, modifiers)
     {
         public override string Label { get; } = "Interface";
@@ -74,7 +74,7 @@ namespace Strazh.Domain
 
     public class MethodNode : CodeNode
     {
-        public MethodNode(string fullName, string name, (string name, string type)[] args, string returnType, string[] modifiers = null)
+        public MethodNode(string fullName, string name, (string name, string type)[] args, string returnType, string[]? modifiers = null)
             : base(fullName, name, modifiers)
         {
             Arguments = string.Join(", ", args.Select(x => $"{x.type} {x.name}"));

@@ -10,7 +10,7 @@ namespace Strazh.Analysis
 {
     public static class Extractor
     {
-        private static TypeNode CreateTypeNode(this ISymbol symbol, TypeDeclarationSyntax declaration)
+        private static TypeNode? CreateTypeNode(this ISymbol symbol, TypeDeclarationSyntax declaration)
         {
             (string fullName, string name) = (symbol.ContainingNamespace.ToString() + '.' + symbol.Name, symbol.Name);
             switch (declaration)
@@ -32,9 +32,9 @@ namespace Strazh.Analysis
         private static string[] MapModifiers(this SyntaxTokenList syntaxTokens)
             => syntaxTokens.Select(x => x.ValueText).ToArray();
 
-        private static TypeNode CreateTypeNode(this TypeInfo typeInfo)
+        private static TypeNode? CreateTypeNode(this TypeInfo typeInfo)
         {
-            switch (typeInfo.ConvertedType.TypeKind)
+            switch (typeInfo.ConvertedType?.TypeKind)
             {
                 case TypeKind.Interface:
                     return CreateInterfaceNode(typeInfo);
@@ -48,27 +48,27 @@ namespace Strazh.Analysis
         }
 
         private static string GetName(this TypeInfo typeInfo)
-            => typeInfo.Type.Name;
+            => typeInfo.Type?.Name ?? "";
 
         private static string GetFullName(this TypeInfo typeInfo)
-            => typeInfo.Type.ContainingNamespace.ToString() + "." + GetName(typeInfo);
+            => (typeInfo.Type?.ContainingNamespace?.ToString() ?? "") + "." + GetName(typeInfo);
 
-        private static string GetNamespaceName(this INamespaceSymbol namespaceSymbol, string name)
+        private static string GetNamespaceName(this INamespaceSymbol? namespaceSymbol, string name)
         {
             var nextName = namespaceSymbol?.Name;
             if (string.IsNullOrEmpty(nextName))
             {
                 return name;
             }
-            return GetNamespaceName(namespaceSymbol.ContainingNamespace, $"{nextName}.{name}");
+            // A non-empty nextName means namespaceSymbol was not null.
+            return GetNamespaceName(namespaceSymbol!.ContainingNamespace, $"{nextName}.{name}");
         }
 
-        private static MethodNode CreateMethodNode(this IMethodSymbol symbol, MethodDeclarationSyntax declaration = null)
+        private static MethodNode CreateMethodNode(this IMethodSymbol symbol, MethodDeclarationSyntax? declaration = null)
         {
-            var temp = $"{symbol.ContainingType}.{symbol.Name}";
             var fullName = symbol.ContainingNamespace.GetNamespaceName($"{symbol.ContainingType.Name}.{symbol.Name}");
-            var args = symbol.Parameters.Select(x => (name: x.Name, type: x.Type.ToString())).ToArray();
-            var returnType = symbol.ReturnType.ToString();
+            var args = symbol.Parameters.Select(x => (name: x.Name, type: x.Type.ToString() ?? "")).ToArray();
+            var returnType = symbol.ReturnType.ToString() ?? "";
             return new MethodNode(fullName,
                 symbol.Name,
                 args,
@@ -77,13 +77,13 @@ namespace Strazh.Analysis
         }
 
         private static string GetName(string filePath)
-            => filePath.Split(Path.DirectorySeparatorChar).Reverse().FirstOrDefault();
+            => filePath.Split(Path.DirectorySeparatorChar)[^1];
 
         private static List<TripleIncludedIn> GetFolderChain(string filePath, FileNode file)
         {
             var triples = new List<TripleIncludedIn>();
             var chain = filePath.Split(Path.DirectorySeparatorChar);
-            FolderNode prev = null;
+            FolderNode? prev = null;
             var path = string.Empty;
             foreach (var item in chain)
             {
@@ -95,13 +95,14 @@ namespace Strazh.Analysis
                 }
                 if (item == file.Name)
                 {
-                    triples.Add(new TripleIncludedIn(file, prev));
+                    // prev is set on the first non-empty segment, which always precedes the file name.
+                    triples.Add(new TripleIncludedIn(file, prev!));
                     return triples;
                 }
                 else
                 {
                     path = Path.DirectorySeparatorChar == '/' ? $"{path}/{item}" : $"{path}\\{item}";
-                    triples.Add(new TripleIncludedIn(new FolderNode(path, item), new FolderNode(prev.FullName, prev.Name)));
+                    triples.Add(new TripleIncludedIn(new FolderNode(path, item), new FolderNode(prev!.FullName, prev.Name)));
                     prev = new FolderNode(path, item);
                 }
             }
@@ -124,7 +125,7 @@ namespace Strazh.Analysis
             var declarations = root.DescendantNodes().OfType<T>();
             foreach (var declaration in declarations)
             {
-                var node = sem.GetDeclaredSymbol(declaration).CreateTypeNode(declaration);
+                var node = sem.GetDeclaredSymbol(declaration)?.CreateTypeNode(declaration);
                 if (node != null)
                 {
                     triples.Add(new TripleDeclaredAt(node, fileNode));
@@ -177,7 +178,12 @@ namespace Strazh.Analysis
             var methods = declaration.DescendantNodes().OfType<MethodDeclarationSyntax>();
             foreach (var method in methods)
             {
-                var methodNode = sem.GetDeclaredSymbol(method).CreateMethodNode(method);
+                var methodSymbol = sem.GetDeclaredSymbol(method);
+                if (methodSymbol is null)
+                {
+                    continue;
+                }
+                var methodNode = methodSymbol.CreateMethodNode(method);
                 triples.Add(new TripleHave(node, methodNode));
 
                 foreach (var syntax in method.DescendantNodes().OfType<ExpressionSyntax>())
