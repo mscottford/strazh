@@ -69,13 +69,41 @@ namespace Strazh.Analysis
         void OnProjectCompleted(string projectFilePath, int tripleCount);
 
         /// <summary>
-        /// Raised when a project cannot be loaded into the Roslyn workspace because
-        /// its type is not supported (e.g. F# or native projects).
+        /// Raised when a project cannot be analyzed normally — its build failed, timed out,
+        /// produced an unreadable log, or could not be loaded into the Roslyn workspace — but
+        /// will be represented from fallback data. This is NOT terminal: the project remains
+        /// pending work until <see cref="OnProjectRecordedFromFallback"/> resolves it (or
+        /// <see cref="OnProjectSkipped"/> if even the fallback cannot represent it).
         /// </summary>
         /// <param name="projectFilePath">Absolute path to the project file.</param>
-        /// <param name="filename">Filename of the skipped project (e.g. MyLib.fsproj).</param>
+        /// <param name="filename">Filename of the deferred project.</param>
+        /// <param name="reason">Human-readable explanation of why normal analysis was not possible.</param>
+        void OnProjectDeferred(string projectFilePath, string filename, string reason);
+
+        /// <summary>
+        /// Raised when a project cannot be represented at all — not even from fallback data
+        /// (e.g. its project file itself could not be read). This is terminal.
+        /// </summary>
+        /// <param name="projectFilePath">Absolute path to the project file.</param>
+        /// <param name="filename">Filename of the skipped project.</param>
         /// <param name="reason">Human-readable explanation of why it was skipped.</param>
         void OnProjectSkipped(string projectFilePath, string filename, string reason);
+
+        /// <summary>
+        /// Raised when a project that could not be fully analyzed is still represented in the
+        /// graph from a fallback — its build result (built but not loadable into the workspace)
+        /// or its static project file (build failed / unreadable / timed out). Resolves a project
+        /// previously reported via <see cref="OnProjectDeferred"/>: this is its terminal event, so
+        /// the deferred (pending) project is completed rather than left looking lost.
+        /// </summary>
+        /// <param name="projectFilePath">Absolute path to the project file.</param>
+        /// <param name="filename">Filename of the project (e.g. Core.Apps.Rdp.csproj).</param>
+        /// <param name="tripleCount">Number of triples recorded for it.</param>
+        /// <param name="buildFailed">
+        /// <c>true</c> when represented from the static project file because no build succeeded;
+        /// <c>false</c> when represented from a successful build result.
+        /// </param>
+        void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed);
 
         /// <summary>
         /// Raised when triple deduplication (GroupBy) throws an exception.

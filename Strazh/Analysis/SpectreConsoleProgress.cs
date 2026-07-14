@@ -133,6 +133,27 @@ namespace Strazh.Analysis
             AnsiConsole.MarkupLine($"{label} {Markup.Escape(filename)} ({Markup.Escape(reason)})");
         }
 
+        public void OnProjectDeferred(string projectFilePath, string filename, string reason)
+        {
+            // Not terminal: keep the project visible in the live panel as pending work (it is
+            // recorded from fallback data later) rather than removing it or counting it done.
+            var name = _names.TryGetValue(projectFilePath, out var n) ? n : filename;
+            var now = DateTime.UtcNow;
+            var start = _startTimes.TryGetValue(projectFilePath, out var st) ? st : now;
+            _active[projectFilePath] = new TaskEntry(name, "deferred", start, now);
+        }
+
+        public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
+        {
+            Interlocked.Increment(ref _completed);
+            _active.TryRemove(projectFilePath, out _);
+            var name = _names.TryGetValue(projectFilePath, out var n) ? n : filename;
+            var note = buildFailed ? "build failed" : "not loaded into workspace";
+            AnsiConsole.MarkupLine(
+                $"[green]✓[/] [bold]{Markup.Escape(name)}[/] [dim]recorded[/]  " +
+                $"[dim]({tripleCount} triples, {note})[/]");
+        }
+
         public void OnGroupingError(string projectName, IReadOnlyList<Triple> triples)
         {
             AnsiConsole.MarkupLine($"[red]Error[/] grouping triples for {Markup.Escape(projectName)}. Dumping detail:");
