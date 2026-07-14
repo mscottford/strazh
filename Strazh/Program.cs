@@ -108,7 +108,7 @@ namespace Strazh
 
                 Console.WriteLine($"Brewing a Code Knowledge Graph of tier \"{config.Tier}\".");
                 var runLogPath = Path.Combine(
-                    config.BuildLogDirectory!,
+                    config.BuildLogDirectory,
                     $"strazh-run-{DateTime.UtcNow:yyyy-MM-ddTHHmmssZ}.log");
                 using var fileProgress = new FileAnalysisProgress(runLogPath);
                 var progress = new CompositeAnalysisProgress(new SpectreConsoleProgress(), fileProgress);

@@ -34,6 +34,36 @@ public class GitHelperTests
         Assert.Equal(subRoot, found);
     }
 
+    /// <summary>
+    /// A linked git worktree stores its .git as a file pointing at a per-worktree gitdir
+    /// under the main repo's .git/worktrees/&lt;name&gt;. FindGitRoot must recognize that file
+    /// so paths inside the worktree resolve to the worktree's own root.
+    /// </summary>
+    [Fact]
+    public void FindGitRoot_RecognizesDotGitFile_InsideWorktreeCheckout()
+    {
+        using var tempRepo = TempRepo.WithOrigin("https://github.com/Org/parent.git");
+        var worktreeRoot = tempRepo.AddWorktreeCheckout("feature");
+
+        var found = GitHelper.FindGitRoot(worktreeRoot);
+
+        Assert.Equal(worktreeRoot, found);
+    }
+
+    /// <summary>
+    /// A worktree's per-worktree gitdir holds only HEAD/index; config (and thus the origin
+    /// remote) lives in the shared common dir referenced by its <c>commondir</c> file.
+    /// GetRepositoryName must follow that pointer to read origin.
+    /// </summary>
+    [Fact]
+    public void GetRepositoryName_InsideWorktreeCheckout_FollowsCommondirToSharedConfig()
+    {
+        using var tempRepo = TempRepo.WithOrigin("https://github.com/Org/parent.git");
+        var worktreeRoot = tempRepo.AddWorktreeCheckout("feature");
+
+        Assert.Equal("Org/parent", GitHelper.GetRepositoryName(worktreeRoot));
+    }
+
     [Fact]
     public void GetRepositoryName_FromRegularRepo_ReturnsOriginOwnerSlashRepo()
     {
@@ -192,6 +222,28 @@ public class GitHelperTests
                 Path.Combine(subRoot, ".git"),
                 $"gitdir: ../.git/modules/{mountPath}");
             return subRoot;
+        }
+
+        /// <summary>
+        /// Creates a fake linked worktree whose <c>.git</c> file points at a per-worktree
+        /// gitdir under <c>{parent}/.git/worktrees/{name}</c>. That gitdir carries only HEAD
+        /// plus a <c>commondir</c> pointer back to the shared <c>{parent}/.git</c>, where the
+        /// origin config lives. Returns the worktree's root.
+        /// </summary>
+        public string AddWorktreeCheckout(string name)
+        {
+            var worktreeGitDir = Path.Combine(Root, ".git", "worktrees", name);
+            Directory.CreateDirectory(worktreeGitDir);
+            // Relative pointer from the per-worktree gitdir back to the shared .git directory.
+            File.WriteAllText(Path.Combine(worktreeGitDir, "commondir"), "../..\n");
+            File.WriteAllText(Path.Combine(worktreeGitDir, "HEAD"), "ref: refs/heads/feature\n");
+
+            var worktreeRoot = Path.Combine(Root, $"worktree-{name}");
+            Directory.CreateDirectory(worktreeRoot);
+            File.WriteAllText(
+                Path.Combine(worktreeRoot, ".git"),
+                $"gitdir: {worktreeGitDir}");
+            return worktreeRoot;
         }
 
         public void WriteGitmodules(string content)
