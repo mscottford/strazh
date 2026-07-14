@@ -4,7 +4,9 @@ using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using Buildalyzer;
+using Buildalyzer.IO;
 using Strazh.Analysis;
 using Strazh.Domain;
 using Xunit;
@@ -22,7 +24,7 @@ public class ProjectTierTriplesTests
     {
         var projectPath = Path.Combine(
             GetRepoRoot(), "SystemUnderTest", "Strazh.Tests.ProjectA", "Strazh.Tests.ProjectA.csproj");
-        var analyzer = new AnalyzerManager().GetProject(projectPath);
+        var analyzer = new AnalyzerManager().GetProject(IOPath.Parse(projectPath))!;
 
         var triples = Analyzer.BuildProjectTriples(analyzer);
 
@@ -107,6 +109,55 @@ public class ProjectTierTriplesTests
         Assert.False(danglingRef.Exists, "a reference to a .csproj not on disk is a non-existent project");
     }
 
+    // A binlog-replay result carries no Analyzer but does carry a Manager, and its per-result
+    // TargetFramework is not populated. The target frameworks must then be read from the project
+    // file via the manager. Exercises the result.Manager.GetProject fallback.
+    [Fact]
+    public void BuildProjectTriples_WithManagerButNoAnalyzer_ReadsFrameworksFromProjectFile()
+    {
+        var projectPath = Path.Combine(
+            GetRepoRoot(), "SystemUnderTest", "Strazh.Tests.ProjectA", "Strazh.Tests.ProjectA.csproj");
+        var result = new FakeAnalyzerResult
+        {
+            ProjectFilePath = projectPath,
+            Succeeded = true,
+            TargetFramework = "",              // no per-result TFM, so the ProjectFile lookup is used
+            Manager = new AnalyzerManager(),   // Analyzer stays null, so the Manager path resolves it
+        };
+
+        var triples = Analyzer.BuildProjectTriples(result);
+
+        var node = triples.Select(t => t.NodeA).OfType<ProjectNode>()
+            .FirstOrDefault(p => p.Name == "Strazh.Tests.ProjectA");
+        Assert.NotNull(node);
+        Assert.Contains("netstandard2.1", node.TargetFrameworks);
+    }
+
+    // The fallback that records dropped projects must skip null analyzers (GetProject returns
+    // null for an unresolvable path) and record a real one from its static project file, flagged
+    // buildFailed, reporting it as recorded.
+    [Fact]
+    public async Task RecordDroppedProjectsAsync_SkipsNullAnalyzerAndRecordsRealOneAsBuildFailed()
+    {
+        var projectPath = Path.Combine(
+            GetRepoRoot(), "SystemUnderTest", "Strazh.Tests.ProjectA", "Strazh.Tests.ProjectA.csproj");
+        var analyzer = new AnalyzerManager().GetProject(IOPath.Parse(projectPath))!;
+        var store = new InMemoryTripleStore();
+
+        await Analyzer.RecordDroppedProjectsAsync(
+            new IProjectAnalyzer?[] { null, analyzer },          // null exercises the guard
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase), // nothing emitted -> analyzer recorded
+            new Dictionary<string, IAnalyzerResult>(),             // no build result -> static project file
+            store,
+            NullAnalysisProgress.Instance);
+
+        var node = store.Triples.Select(t => t.NodeA).OfType<ProjectNode>()
+            .FirstOrDefault(p => p.Name == "Strazh.Tests.ProjectA");
+        Assert.NotNull(node);
+        Assert.True(node.BuildFailed);
+        Assert.Contains("netstandard2.1", node.TargetFrameworks);
+    }
+
     // A project with no result at all (build failed, timed out, or an unreadable build log) has
     // only its static project file to go on and is flagged buildFailed.
     [Fact]
@@ -114,7 +165,7 @@ public class ProjectTierTriplesTests
     {
         var projectPath = Path.Combine(
             GetRepoRoot(), "SystemUnderTest", "Strazh.Tests.ProjectA", "Strazh.Tests.ProjectA.csproj");
-        var analyzer = new AnalyzerManager().GetProject(projectPath);
+        var analyzer = new AnalyzerManager().GetProject(IOPath.Parse(projectPath))!;
 
         var triples = Analyzer.BuildDroppedProjectTriples(analyzer, builtButNotLoadedResult: null);
 
@@ -136,8 +187,8 @@ public class ProjectTierTriplesTests
         public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> PackageReferences { get; init; }
             = new Dictionary<string, IReadOnlyDictionary<string, string>>();
 
-        public ProjectAnalyzer? Analyzer => null;
-        public AnalyzerManager Manager => null!;
+        public ProjectAnalyzer Analyzer => null!;
+        public AnalyzerManager Manager { get; init; } = null!;
         public IReadOnlyDictionary<string, IProjectItem[]> Items => new Dictionary<string, IProjectItem[]>();
         public Guid ProjectGuid => Guid.Empty;
         public IReadOnlyDictionary<string, string> Properties => new Dictionary<string, string>();
@@ -151,6 +202,6 @@ public class ProjectTierTriplesTests
         public string Command => "";
         public string CompilerFilePath => "";
         public string[] CompilerArguments => Array.Empty<string>();
-        public string? GetProperty(string name) => null;
+        public string GetProperty(string name) => null!;
     }
 }

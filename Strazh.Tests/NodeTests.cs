@@ -82,4 +82,21 @@ public class NodeTests
 
         Assert.Contains("p.version = \"13.0.1\"", node.Set("p"));
     }
+
+    [Fact]
+    public void ProjectNode_OmitsTargetFrameworksWhenNull()
+    {
+        var node = new ProjectNode("Repo.Lib", "Repo.Lib", targetFrameworks: null);
+
+        Assert.Empty(node.TargetFrameworks);
+        Assert.DoesNotContain("targetFrameworks", node.Set("p"));
+    }
+
+    [Fact]
+    public void ProjectNode_WritesTargetFrameworkListWhenProvided()
+    {
+        var node = new ProjectNode("Repo.Lib", "Repo.Lib", new[] { "net8.0", "net472" });
+
+        Assert.Contains("p.targetFrameworks = [\"net8.0\", \"net472\"]", node.Set("p"));
+    }
 }

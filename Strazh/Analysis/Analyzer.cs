@@ -141,44 +141,64 @@ namespace Strazh.Analysis
                 // progress scope keeps these visible as work being completed rather than lost.
                 if (config.Tier == Tiers.All || config.Tier == Tiers.Project)
                 {
-                    foreach (var analyzer in projectAnalyzers)
-                    {
-                        string path;
-                        try
-                        {
-                            path = analyzer.ProjectFile.Path;
-                        }
-                        catch
-                        {
-                            continue; // cannot even identify this project
-                        }
-                        if (emittedPaths.Contains(path))
-                        {
-                            continue;
-                        }
-
-                        var filename = Path.GetFileName(path);
-                        var displayName = GetProjectName(path);
-                        builtButNotLoaded.TryGetValue(path, out var builtResult);
-                        try
-                        {
-                            progress.OnStageChanged(path, displayName, "Recording");
-                            var triples = BuildDroppedProjectTriples(analyzer, builtResult)
-                                .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
-                            await store.InsertAsync(triples);
-                            progress.OnProjectRecordedFromFallback(path, filename, triples.Count, buildFailed: builtResult == null);
-                        }
-                        catch
-                        {
-                            // Even the fallback could not represent it (e.g. the project file
-                            // itself is unreadable) — report it as a genuine terminal skip.
-                            progress.OnProjectSkipped(path, filename, "could not be recorded from fallback");
-                        }
-                    }
+                    await RecordDroppedProjectsAsync(projectAnalyzers, emittedPaths, builtButNotLoaded, store, progress);
                 }
             });
 
             workspace.Dispose();
+        }
+
+        // Records every project the streaming pipeline dropped (deferred): projects that never
+        // reached the stream because their build failed / timed out / produced an unreadable log,
+        // or that built but could not be loaded into the workspace. Each is represented from its
+        // build result when one is available (references preserved, not flagged buildFailed) or
+        // from its static project file otherwise (flagged buildFailed), so none is silently missing.
+        // Intended to run inside the progress scope so deferred projects are seen completed, not lost.
+        public static async Task RecordDroppedProjectsAsync(
+            IEnumerable<IProjectAnalyzer?> projectAnalyzers,
+            HashSet<string> emittedPaths,
+            IReadOnlyDictionary<string, IAnalyzerResult> builtButNotLoaded,
+            ITripleStore store,
+            IAnalysisProgress progress)
+        {
+            foreach (var analyzer in projectAnalyzers)
+            {
+                if (analyzer is null)
+                {
+                    continue; // GetProject returned null for an unresolvable path
+                }
+                string path;
+                try
+                {
+                    path = analyzer.ProjectFile.Path;
+                }
+                catch
+                {
+                    continue; // cannot even identify this project
+                }
+                if (emittedPaths.Contains(path))
+                {
+                    continue;
+                }
+
+                var filename = Path.GetFileName(path);
+                var displayName = GetProjectName(path);
+                builtButNotLoaded.TryGetValue(path, out var builtResult);
+                try
+                {
+                    progress.OnStageChanged(path, displayName, "Recording");
+                    var triples = BuildDroppedProjectTriples(analyzer, builtResult)
+                        .GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
+                    await store.InsertAsync(triples);
+                    progress.OnProjectRecordedFromFallback(path, filename, triples.Count, buildFailed: builtResult == null);
+                }
+                catch
+                {
+                    // Even the fallback could not represent it (e.g. the project file itself is
+                    // unreadable) — report it as a genuine terminal skip.
+                    progress.OnProjectSkipped(path, filename, "could not be recorded from fallback");
+                }
+            }
         }
 
         public class AnalysisContext(AdhocWorkspace workspace, List<(Project, IAnalyzerResult)> projects)
@@ -976,7 +996,7 @@ namespace Strazh.Analysis
             var root = GetRoot(path);
             var rootNode = new FolderNode(root, root);
 
-            var analyzer = result.Analyzer ?? result.Manager?.GetProject(path);
+            var analyzer = result.Analyzer ?? result.Manager?.GetProject(IOPath.Parse(path));
             var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
             if (targetFrameworks.Length == 0 && !string.IsNullOrEmpty(result.TargetFramework))
             {
@@ -1029,10 +1049,11 @@ namespace Strazh.Analysis
         // its references, so it is represented from that (and is not a build failure). Otherwise
         // (build failed, timed out, or an unreadable build log) only the static project file remains,
         // and the project is flagged buildFailed.
-        public static IList<Triple> BuildDroppedProjectTriples(IProjectAnalyzer analyzer, IAnalyzerResult builtButNotLoadedResult)
+        public static IList<Triple> BuildDroppedProjectTriples(IProjectAnalyzer? analyzer, IAnalyzerResult? builtButNotLoadedResult)
             => builtButNotLoadedResult != null
                 ? BuildProjectTriples(builtButNotLoadedResult)
-                : BuildProjectTriples(analyzer);
+                // No result means the project never built, so the caller always supplies the analyzer.
+                : BuildProjectTriples(analyzer!);
 
         private static string GetSolutionName(string fullName)
             => fullName.Split(Path.DirectorySeparatorChar).Last().Replace(".sln", "");

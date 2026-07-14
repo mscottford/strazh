@@ -146,7 +146,7 @@ namespace Strazh.Domain
         public override string Label => "Solution";
     }
 
-    public class ProjectNode(string fullName, string name, string[] targetFrameworks = null, bool exists = true, bool buildFailed = false)
+    public class ProjectNode(string fullName, string name, string[]? targetFrameworks = null, bool exists = true, bool buildFailed = false)
         : Node(fullName, name)
     {
         public ProjectNode(string name)
