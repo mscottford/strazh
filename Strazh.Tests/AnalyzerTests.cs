@@ -232,6 +232,66 @@ public class AnalyzerTests
         }
     }
 
+    /// <summary>
+    /// A directory scan sweeps up every .sln, including ones MSBuild's solution parser rejects
+    /// (e.g. a legacy solution referencing a .vcproj). Such a solution must not abort the whole
+    /// run — it is recorded as a Solution node flagged buildFailed so it is still represented,
+    /// and analysis continues. Uses the in-memory store so no Neo4j is required.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_DirectoryMode_RecordsUnparseableSolutionAsBuildFailed_WithoutAborting()
+    {
+        var scanRoot = Path.Combine(Path.GetTempPath(), $"strazh-badsln-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(scanRoot);
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-badsln-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-badsln-log-{Guid.NewGuid():N}");
+        try
+        {
+            // A solution whose only project is a legacy .vcproj — MSBuild's SolutionFile parser
+            // throws InvalidProjectFileException on it, which is exactly the case that used to
+            // abort the entire directory run.
+            await File.WriteAllTextAsync(Path.Combine(scanRoot, "Legacy.sln"),
+                "Microsoft Visual Studio Solution File, Format Version 12.00\n" +
+                "# Visual Studio Version 17\n" +
+                "Project(\"{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}\") = \"hooks\", \"hooks.vcproj\", " +
+                "\"{2E8F2E4A-1B2C-4D5E-9F00-000000000001}\"\n" +
+                "EndProject\n" +
+                "Global\nEndGlobal\n");
+
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: "none",
+                Projects: null,
+                Directory: scanRoot,
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            var store = new InMemoryTripleStore();
+
+            // Must not throw despite the unparseable solution.
+            await Analyzer.Analyze(config, NullAnalysisProgress.Instance, store);
+
+            var legacy = store.Triples
+                .SelectMany(t => new[] { t.NodeA, t.NodeB })
+                .OfType<SolutionNode>()
+                .FirstOrDefault(s => s.Name == "Legacy");
+            Assert.NotNull(legacy);
+            Assert.True(legacy!.BuildFailed);
+        }
+        finally
+        {
+            foreach (var dir in new[] { scanRoot, cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+        }
+    }
+
     // [CallerFilePath] gives the compile-time absolute path of this source file.
     // From Strazh.Tests/AnalyzerTests.cs, two levels up reaches the repo root.
     private static string GetRepoRoot([CallerFilePath] string callerFile = "") =>

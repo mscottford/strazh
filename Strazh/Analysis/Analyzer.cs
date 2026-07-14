@@ -193,7 +193,32 @@ namespace Strazh.Analysis
             foreach (var solutionPath in solutionPaths)
             {
                 var solutionName = GetSolutionName(solutionPath);
-                var solutionManager = new AnalyzerManager(IOPath.Parse(solutionPath), managerOptions);
+
+                // Let Buildalyzer parse the solution, but keep going if it can't. A directory
+                // scan sweeps up every .sln, including ones MSBuild's solution parser rejects —
+                // e.g. a legacy solution that still references a .vcproj. Rather than aborting the
+                // whole run (the old per-solution-process flow only tolerated this because each
+                // solution ran in its own process), record the Solution node flagged buildFailed
+                // so it is still represented — its membership just couldn't be analyzed — and move
+                // on to the next solution.
+                IAnalyzerManager solutionManager;
+                try
+                {
+                    solutionManager = new AnalyzerManager(IOPath.Parse(solutionPath), managerOptions);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Recording solution \"{solutionName}\" as not analyzed: {ex.Message}");
+                    var solutionRoot = GetRoot(solutionPath);
+                    await store.InsertAsync(new List<Triple>
+                    {
+                        new TripleIncludedIn(
+                            new SolutionNode(solutionName, buildFailed: true),
+                            new FolderNode(solutionRoot, solutionRoot)),
+                    });
+                    continue;
+                }
+
                 var triples = new List<Triple>();
                 foreach (var project in solutionManager.Projects.Values)
                 {
