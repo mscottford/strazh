@@ -43,4 +43,12 @@ public class FolderNodeTests
 
         Assert.Contains("f.kind = \"Submodule\"", folder.Set("f"));
     }
+
+    [Fact]
+    public void Properties_OmitsKindForRegularAndWritesForSubmodule()
+    {
+        Assert.DoesNotContain("kind", new FolderNode("foo", "foo").Properties().Keys);
+        Assert.Equal("Submodule",
+            new FolderNode("host/Core", "Core", FolderKind.Submodule).Properties()["kind"]);
+    }
 }

@@ -99,4 +99,69 @@ public class NodeTests
 
         Assert.Contains("p.targetFrameworks = [\"net8.0\", \"net472\"]", node.Set("p"));
     }
+
+    // Properties() feeds the parameterized UNWIND write path and must stay in lockstep with
+    // Set(): the same keys, gated by the same conditions, so both write identical graphs.
+
+    [Fact]
+    public void Properties_CoreKeysAlwaysPresent()
+    {
+        var node = new ClassNode("Ns.Foo", "Foo");
+
+        var props = node.Properties();
+        Assert.Equal(node.Pk, props["pk"]);
+        Assert.Equal("Ns.Foo", props["fullName"]);
+        Assert.Equal("Foo", props["name"]);
+    }
+
+    [Fact]
+    public void Properties_OmitsModifiersWhenNullAndWritesWhenProvided()
+    {
+        Assert.DoesNotContain("modifiers", new ClassNode("Ns.Foo", "Foo").Properties().Keys);
+        Assert.Equal("public, sealed",
+            new ClassNode("Ns.Foo", "Foo", new[] { "public", "sealed" }).Properties()["modifiers"]);
+    }
+
+    [Fact]
+    public void Properties_MethodNodeCarriesSignature()
+    {
+        var node = new MethodNode(
+            "Ns.Foo.Bar",
+            "Bar",
+            new[] { (name: "count", type: "int") },
+            "bool");
+
+        var props = node.Properties();
+        Assert.Equal("bool", props["returnType"]);
+        Assert.Equal("int count", props["arguments"]);
+    }
+
+    [Fact]
+    public void Properties_PackageNodeCarriesVersion()
+    {
+        Assert.Equal("13.0.1",
+            new PackageNode("Newtonsoft.Json", "Newtonsoft.Json", "13.0.1").Properties()["version"]);
+    }
+
+    [Fact]
+    public void Properties_ProjectNodeTargetFrameworksAsNativeList()
+    {
+        var withTfms = new ProjectNode("Repo.Lib", "Repo.Lib", new[] { "net8.0", "net472" });
+        Assert.Equal(new[] { "net8.0", "net472" }, (string[])withTfms.Properties()["targetFrameworks"]);
+
+        Assert.DoesNotContain("targetFrameworks",
+            new ProjectNode("Repo.Lib", "Repo.Lib", targetFrameworks: null).Properties().Keys);
+    }
+
+    [Fact]
+    public void Properties_ProjectNodeFlagsOnlyWhenNotable()
+    {
+        var normal = new ProjectNode("Repo.Lib", "Repo.Lib").Properties();
+        Assert.DoesNotContain("exists", normal.Keys);
+        Assert.DoesNotContain("buildFailed", normal.Keys);
+
+        var dangling = new ProjectNode("Repo.Lib", "Repo.Lib", exists: false, buildFailed: true).Properties();
+        Assert.Equal(false, dangling["exists"]);
+        Assert.Equal(true, dangling["buildFailed"]);
+    }
 }
