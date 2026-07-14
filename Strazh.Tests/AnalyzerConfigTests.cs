@@ -12,13 +12,15 @@ public class AnalyzerConfigTests
         string? tier = "all",
         string? delete = "false",
         string? solution = "none",
-        string[]? projects = null)
+        string[]? projects = null,
+        string? directory = null)
         => new(
             Credentials: credentials!,
             Tier: tier!,
             Delete: delete!,
             Solution: solution!,
-            Projects: projects ?? Array.Empty<string>());
+            Projects: projects ?? Array.Empty<string>(),
+            Directory: directory);
 
     [Fact]
     public void Credentials_ValidTriplet_IsParsedIntoParts()
@@ -80,6 +82,45 @@ public class AnalyzerConfigTests
 
         Assert.Equal("", config.Solution);
         Assert.False(config.IsSolutionBased);
+    }
+
+    [Fact]
+    public void Directory_None_IsTreatedAsEmpty()
+    {
+        var config = new AnalyzerConfig(BaseOptions(directory: "none"));
+
+        Assert.Equal("", config.Directory);
+        Assert.False(config.IsDirectoryBased);
+    }
+
+    [Fact]
+    public void Directory_WhenProvided_IsResolvedToAbsolutePathAndDirectoryBased()
+    {
+        var config = new AnalyzerConfig(BaseOptions(directory: "some/dir"));
+
+        Assert.True(config.IsDirectoryBased);
+        Assert.True(Path.IsPathRooted(config.Directory));
+    }
+
+    [Theory]
+    // exactly one source → valid
+    [InlineData("app.sln", false, false, true)]
+    [InlineData("none", true, false, true)]
+    [InlineData("none", false, true, true)]
+    // zero or more than one source → invalid
+    [InlineData("none", false, false, false)]
+    [InlineData("app.sln", true, false, false)]
+    [InlineData("app.sln", false, true, false)]
+    [InlineData("none", true, true, false)]
+    [InlineData("app.sln", true, true, false)]
+    public void IsValid_RequiresExactlyOneSource(string solution, bool hasProjects, bool hasDirectory, bool expected)
+    {
+        var config = new AnalyzerConfig(BaseOptions(
+            solution: solution,
+            projects: hasProjects ? new[] { "a.csproj" } : null,
+            directory: hasDirectory ? "some/dir" : null));
+
+        Assert.Equal(expected, config.IsValid);
     }
 
     [Fact]

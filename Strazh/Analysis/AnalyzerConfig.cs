@@ -40,6 +40,7 @@ namespace Strazh.Analysis
             string? Delete,
             string? Solution,
             string[]? Projects,
+            string? Directory = null,
             string? CacheDirectory = null,
             bool NoCache = false,
             string? BuildLogDirectory = null,
@@ -50,6 +51,7 @@ namespace Strazh.Analysis
         public Tiers Tier { get; }
         public string Solution { get; }
         public string[] Projects { get; }
+        public string Directory { get; }
         public bool IsDelete { get; }
         public string CacheDirectory { get; }
         public bool NoCache { get; }
@@ -58,12 +60,17 @@ namespace Strazh.Analysis
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
 
-        public bool IsValid => (!string.IsNullOrEmpty(Solution) && Projects.Length == 0)
-            || (string.IsNullOrEmpty(Solution) && Projects.Length > 0);
+        public bool IsDirectoryBased => !string.IsNullOrEmpty(Directory);
+
+        // Exactly one analysis source must be given: a single solution, an explicit list of
+        // projects, or a directory to scan for both.
+        public bool IsValid =>
+            ((IsSolutionBased ? 1 : 0) + (Projects.Length > 0 ? 1 : 0) + (IsDirectoryBased ? 1 : 0)) == 1;
 
         public AnalyzerConfig(Options options)
         {
             var solution = options.Solution == "none" ? "" : options.Solution;
+            var directory = options.Directory == "none" ? "" : options.Directory;
             Credentials = new CredentialsConfig(options.Credentials);
             Tier = MapTier(options.Tier);
             IsDelete = options.Delete != "false";
@@ -71,6 +78,7 @@ namespace Strazh.Analysis
             Projects = (options.Projects ?? Array.Empty<string>())
                 .Select(Path.GetFullPath)
                 .ToArray();
+            Directory = string.IsNullOrEmpty(directory) ? "" : Path.GetFullPath(directory);
             // SpecialFolder.ApplicationData returns empty string on Linux when $HOME is unset
             // (e.g. inside certain Docker images). Fall back through UserProfile and $HOME to
             // the system temp directory so the cache path is always absolute and usable.

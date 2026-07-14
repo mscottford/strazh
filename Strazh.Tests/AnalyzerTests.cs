@@ -172,6 +172,66 @@ public class AnalyzerTests
         Assert.NotNull(repoTriple);
     }
 
+    /// <summary>
+    /// Directory mode is the single-pass replacement for the old two-pass flow (a per-solution
+    /// run followed by a project sweep). Pointed at a directory, one <see cref="Analyzer.Analyze"/>
+    /// call must discover the solution and both projects, produce the project nodes, AND record
+    /// the solution's CONTAINS edges — the union of what the two separate passes used to emit.
+    /// Uses the in-memory store so no Neo4j is required.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_DirectoryMode_DiscoversSolutionAndAllProjectsInOnePass()
+    {
+        var directory = Path.Combine(GetRepoRoot(), "SystemUnderTest");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-dir-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-dir-log-{Guid.NewGuid():N}");
+        try
+        {
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: "none",
+                Projects: null,
+                Directory: directory,
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            var store = new InMemoryTripleStore();
+            await Analyzer.Analyze(config, NullAnalysisProgress.Instance, store);
+
+            var triples = store.Triples;
+
+            // Both projects were discovered and analyzed (project nodes exist).
+            var projectNames = triples
+                .SelectMany(t => new[] { t.NodeA, t.NodeB })
+                .OfType<ProjectNode>()
+                .Select(p => p.Name)
+                .ToHashSet();
+            Assert.Contains("Strazh.Tests.ProjectA", projectNames);
+            Assert.Contains("Strazh.Tests.ProjectB", projectNames);
+
+            // ...and the solution's CONTAINS edges were recorded in the same run.
+            var containedBySolution = triples
+                .OfType<TripleContains>()
+                .Where(t => t.NodeA is SolutionNode s && s.Name == "SystemUnderTest")
+                .Select(t => ((ProjectNode)t.NodeB).Name)
+                .ToHashSet();
+            Assert.Contains("Strazh.Tests.ProjectA", containedBySolution);
+            Assert.Contains("Strazh.Tests.ProjectB", containedBySolution);
+        }
+        finally
+        {
+            foreach (var dir in new[] { cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+        }
+    }
+
     // [CallerFilePath] gives the compile-time absolute path of this source file.
     // From Strazh.Tests/AnalyzerTests.cs, two levels up reaches the repo root.
     private static string GetRepoRoot([CallerFilePath] string callerFile = "") =>

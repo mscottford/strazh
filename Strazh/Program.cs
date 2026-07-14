@@ -42,10 +42,16 @@ namespace Strazh
 
             var optionProjects = new Option<string[]>("--projects", "-p")
             {
-                Description = "optional list of absolute path to one or many `.csproj` files (can't be used together with -s / --solution)",
+                Description = "optional list of absolute path to one or many `.csproj` files (can't be used together with -s / --solution or -D / --directory)",
                 AllowMultipleArgumentsPerToken = true
             };
             rootCommand.Options.Add(optionProjects);
+
+            var optionDirectory = new Option<string>("--directory", "-D")
+            {
+                Description = "optional absolute path to a directory to scan; every `.sln` and `.csproj` beneath it is analyzed in one pass (can't be used together with -s / --solution or -p / --projects)"
+            };
+            rootCommand.Options.Add(optionDirectory);
 
             var optionCache = new Option<string>("--cache")
             {
@@ -79,6 +85,7 @@ namespace Strazh
                     Delete: parseResult.GetValue(optionDelete),
                     Solution: parseResult.GetValue(optionSolution),
                     Projects: parseResult.GetValue(optionProjects),
+                    Directory: parseResult.GetValue(optionDirectory),
                     CacheDirectory: parseResult.GetValue(optionCache),
                     NoCache: parseResult.GetValue(optionNoCache),
                     BuildLogDirectory: parseResult.GetValue(optionBuildLogDir),
@@ -96,7 +103,7 @@ namespace Strazh
                 var config = new AnalyzerConfig(options);
                 if (!config.IsValid)
                 {
-                    Console.WriteLine("Please submit only one thing: `--solution` (-s) or `--projects` (-p)");
+                    Console.WriteLine("Please submit exactly one of: `--solution` (-s), `--projects` (-p), or `--directory` (-D)");
                     return;
                 }
                 var isNeo4jReady = await Healthcheck.IsNeo4jReady(config.Neo4jUrl);

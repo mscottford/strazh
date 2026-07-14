@@ -16,6 +16,7 @@ using static Strazh.Analysis.AnalyzerConfig;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Strazh.Analysis
 {
@@ -33,9 +34,28 @@ namespace Strazh.Analysis
                 ? new AnalyzerManager(IOPath.Parse(config.Solution), managerOptions)
                 : new AnalyzerManager(managerOptions);
 
+            // Directory mode: discover every solution and project beneath the directory so they
+            // are analyzed in a single build/load pass instead of the caller making separate
+            // per-solution and project-sweep runs. The projects flow through the normal
+            // project-based pipeline below (so loose projects not in any solution are still
+            // captured); the solutions are recorded afterwards to add Solution + CONTAINS edges.
+            var directorySolutions = config.IsDirectoryBased
+                ? DiscoverFiles(config.Directory, "*.sln")
+                : Array.Empty<string>();
+            var directoryProjects = config.IsDirectoryBased
+                ? DiscoverFiles(config.Directory, "*.csproj")
+                : Array.Empty<string>();
+
+            if (config.IsDirectoryBased)
+            {
+                Console.WriteLine(
+                    $"Scanning \"{config.Directory}\": found {directorySolutions.Length} solution/s and {directoryProjects.Length} project/s.");
+            }
+
             var projectAnalyzers = (config.IsSolutionBased
                 ? manager.Projects.Values
-                : config.Projects.Select(x => manager.GetProject(IOPath.Parse(x)))).ToList();
+                : (config.IsDirectoryBased ? directoryProjects : config.Projects)
+                    .Select(x => manager.GetProject(IOPath.Parse(x)))).ToList();
 
             Console.WriteLine($"Analyzer ready to analyze {projectAnalyzers.Count} project/s.");
 
@@ -98,7 +118,10 @@ namespace Strazh.Analysis
 
                         if (config.IsSolutionBased)
                         {
-                            triples.AddRange(GetSolutionAndRepositoryTriples(manager, capturedEntry));
+                            triples.AddRange(GetSolutionAndRepositoryTriples(
+                                manager.Solution!.Path.ToString(),
+                                capturedEntry.Item1.FilePath,
+                                GetProjectName(capturedEntry.Item1.Name)));
                         }
 
                         var projectTriples = await AnalyzeProject(capturedEntry, config.Tier);
@@ -146,6 +169,57 @@ namespace Strazh.Analysis
             });
 
             workspace.Dispose();
+
+            // Directory mode: now that every project has been analyzed, add the solution-level
+            // structure. Membership is parsed from each .sln (no build needed); the projects it
+            // lists already exist as nodes from the stream above, so this only MERGEs the
+            // Solution, CONTAINS, and repository/folder triples on top.
+            if (config.IsDirectoryBased)
+            {
+                await RecordSolutionsAsync(directorySolutions, managerOptions, store);
+            }
+        }
+
+        // Records the Solution, CONTAINS, and repository/folder triples for every solution found
+        // during a directory scan. Membership comes from parsing each .sln — no build — so the
+        // projects it lists get a CONTAINS edge exactly as a per-solution run would emit. The
+        // project/package/code triples themselves come from the project stream, so this only
+        // layers the solution structure on top.
+        private static async Task RecordSolutionsAsync(
+            IEnumerable<string> solutionPaths,
+            AnalyzerManagerOptions managerOptions,
+            ITripleStore store)
+        {
+            foreach (var solutionPath in solutionPaths)
+            {
+                var solutionName = GetSolutionName(solutionPath);
+                var solutionManager = new AnalyzerManager(IOPath.Parse(solutionPath), managerOptions);
+                var triples = new List<Triple>();
+                foreach (var project in solutionManager.Projects.Values)
+                {
+                    var projectPath = project.ProjectFile.Path;
+                    triples.AddRange(GetSolutionAndRepositoryTriples(
+                        solutionPath, projectPath, GetProjectName(projectPath)));
+                }
+                triples = triples.GroupBy(x => x.ToString()).Select(g => g.First()).ToList();
+                Console.WriteLine(
+                    $"Recording solution \"{solutionName}\" ({solutionManager.Projects.Count} project/s).");
+                await store.InsertAsync(triples);
+            }
+        }
+
+        // Enumerates files matching a pattern beneath root, skipping build output (bin/obj) so a
+        // project's compiled copies under obj/ are not mistaken for source projects.
+        private static string[] DiscoverFiles(string root, string pattern)
+            => Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories)
+                .Where(path => !IsInBuildOutput(root, path))
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+        private static bool IsInBuildOutput(string root, string path)
+        {
+            var relative = Path.GetRelativePath(root, path).Replace('\\', '/');
+            return Regex.IsMatch(relative, @"(^|/)(bin|obj)/");
         }
 
         // Records every project the streaming pipeline dropped (deferred): projects that never
@@ -867,13 +941,11 @@ namespace Strazh.Analysis
         // both produce identical Folder PKs and Repository associations for the submodule's
         // contents, so a folder containing a submodule project is never tied to the host repo.
         private static IList<Triple> GetSolutionAndRepositoryTriples(
-            IAnalyzerManager manager,
-            (Project project, IAnalyzerResult result) entry)
+            string solutionFilePath,
+            string? projectFilePath,
+            string projectName)
         {
             var triples = new List<Triple>();
-
-            // This method only runs for solution-based analysis, so Solution is non-null.
-            var solutionFilePath = manager.Solution!.Path.ToString();
 
             var solutionRoot = GetRoot(solutionFilePath);
             var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
@@ -910,7 +982,7 @@ namespace Strazh.Analysis
 
             // The project's own git root determines its repository. For a project living
             // inside a submodule, this is the submodule's git root — not the solution's.
-            var projectPath = entry.Item1.FilePath;
+            var projectPath = projectFilePath;
             var projectGitRoot = projectPath != null ? GitHelper.FindGitRoot(projectPath) : null;
             var projectRepoName = projectPath != null ? GitHelper.GetRepositoryName(projectPath) : null;
             var projectIsInSubmodule = projectGitRoot != null
@@ -934,7 +1006,7 @@ namespace Strazh.Analysis
                 }
             }
 
-            var projectNode = new ProjectNode(GetProjectName(entry.Item1.Name));
+            var projectNode = new ProjectNode(projectName);
             triples.Add(new TripleContains(solutionNode, projectNode));
 
             return triples;
