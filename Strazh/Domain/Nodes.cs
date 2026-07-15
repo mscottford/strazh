@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -40,8 +41,23 @@ namespace Strazh.Domain
             return Convert.ToHexString(bytes);
         }
 
-        public virtual string Set(string node) => 
+        public virtual string Set(string node) =>
             $"{node}.pk = \"{Pk}\", {node}.fullName = \"{FullName}\", {node}.name = \"{Name}\"";
+
+        /// <summary>
+        /// The node's properties as a parameter map, used by the batched, parameterized
+        /// UNWIND write path (<c>SET n += map</c>). Mirrors <see cref="Set"/> exactly: the
+        /// same properties, gated by the same conditions, so both paths write identical graphs.
+        /// Keeping optional properties out of the map (rather than writing null) preserves the
+        /// "don't clobber" MERGE semantics — a reference-only node simply omits them.
+        /// </summary>
+        public virtual IDictionary<string, object> Properties()
+            => new Dictionary<string, object>
+            {
+                ["pk"] = Pk,
+                ["fullName"] = FullName,
+                ["name"] = Name,
+            };
 
         public string ToInspection() =>
             $$"""{ "Pk": {{Pk.Inspect()}}, "Label": {{Label.Inspect()}}, "FullName": {{FullName.Inspect()}}, "Name": {{Name.Inspect()}} }""";
@@ -55,6 +71,16 @@ namespace Strazh.Domain
 
         public override string Set(string node)
             => $"{base.Set(node)}{(string.IsNullOrEmpty(Modifiers) ? "" : $", {node}.modifiers = \"{Modifiers}\"")}";
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            if (!string.IsNullOrEmpty(Modifiers))
+            {
+                p["modifiers"] = Modifiers;
+            }
+            return p;
+        }
     }
 
     public abstract class TypeNode(string fullName, string name, string[]? modifiers = null)
@@ -90,6 +116,14 @@ namespace Strazh.Domain
 
         public override string Set(string node)
             => $"{base.Set(node)}, {node}.returnType = \"{ReturnType}\", {node}.arguments = \"{Arguments}\"";
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            p["returnType"] = ReturnType;
+            p["arguments"] = Arguments;
+            return p;
+        }
 
         protected override void SetPrimaryKey()
         {
@@ -139,6 +173,16 @@ namespace Strazh.Domain
             => Kind == FolderKind.Regular
                 ? base.Set(node)
                 : $"{base.Set(node)}, {node}.kind = \"{Kind}\"";
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            if (Kind != FolderKind.Regular)
+            {
+                p["kind"] = Kind.ToString();
+            }
+            return p;
+        }
     }
 
     public class SolutionNode(string name) : Node(name, name)
@@ -185,6 +229,24 @@ namespace Strazh.Domain
             }
             return set;
         }
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            if (TargetFrameworks.Length > 0)
+            {
+                p["targetFrameworks"] = TargetFrameworks;
+            }
+            if (!Exists)
+            {
+                p["exists"] = false;
+            }
+            if (BuildFailed)
+            {
+                p["buildFailed"] = true;
+            }
+            return p;
+        }
     }
 
     public class RepositoryNode(string name) : Node(name, name)
@@ -207,6 +269,13 @@ namespace Strazh.Domain
 
         public override string Set(string node)
             => $"{base.Set(node)}, {node}.version = \"{Version}\"";
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            p["version"] = Version;
+            return p;
+        }
 
         protected override void SetPrimaryKey()
         {
