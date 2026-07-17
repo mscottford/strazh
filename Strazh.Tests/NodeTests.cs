@@ -154,6 +154,22 @@ public class NodeTests
     }
 
     [Fact]
+    public void SolutionNode_OmitsBuildFailedByDefault_WritesItWhenFlagged()
+    {
+        Assert.DoesNotContain("buildFailed", new SolutionNode("App").Set("s"));
+        Assert.DoesNotContain("buildFailed", new SolutionNode("App").Properties().Keys);
+
+        Assert.Contains("s.buildFailed = true", new SolutionNode("App", buildFailed: true).Set("s"));
+        Assert.Equal(true, new SolutionNode("App", buildFailed: true).Properties()["buildFailed"]);
+    }
+
+    [Fact]
+    public void SolutionNode_BuildFailedNotPartOfPk()
+    {
+        Assert.Equal(new SolutionNode("App").Pk, new SolutionNode("App", buildFailed: true).Pk);
+    }
+
+    [Fact]
     public void Properties_ProjectNodeFlagsOnlyWhenNotable()
     {
         var normal = new ProjectNode("Repo.Lib", "Repo.Lib").Properties();

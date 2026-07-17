@@ -185,9 +185,29 @@ namespace Strazh.Domain
         }
     }
 
-    public class SolutionNode(string name) : Node(name, name)
+    public class SolutionNode(string name, bool buildFailed = false) : Node(name, name)
     {
         public override string Label => "Solution";
+
+        /// <summary>True when the solution file could not be parsed/loaded — e.g. it references
+        /// a project type MSBuild no longer supports (a legacy .vcproj) — so its membership could
+        /// not be analyzed. buildFailed is not part of the pk, so a flagged node MERGEs onto the
+        /// same Solution as an unflagged one of the same name.</summary>
+        public bool BuildFailed { get; } = buildFailed;
+
+        // Emitted only when notable, so normally-loaded solutions stay clean.
+        public override string Set(string node)
+            => BuildFailed ? $"{base.Set(node)}, {node}.buildFailed = true" : base.Set(node);
+
+        public override IDictionary<string, object> Properties()
+        {
+            var p = base.Properties();
+            if (BuildFailed)
+            {
+                p["buildFailed"] = true;
+            }
+            return p;
+        }
     }
 
     public class ProjectNode(string fullName, string name, string[]? targetFrameworks = null, bool exists = true, bool buildFailed = false)

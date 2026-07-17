@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Buildalyzer;
 using Buildalyzer.IO;
@@ -170,6 +171,186 @@ public class AnalyzerTests
             t.Relationship.Type == "INCLUDED_IN");
 
         Assert.NotNull(repoTriple);
+    }
+
+    /// <summary>
+    /// Directory mode is the single-pass replacement for the old two-pass flow (a per-solution
+    /// run followed by a project sweep). Pointed at a directory, one <see cref="Analyzer.Analyze"/>
+    /// call must discover the solution and both projects, produce the project nodes, AND record
+    /// the solution's CONTAINS edges — the union of what the two separate passes used to emit.
+    /// Uses the in-memory store so no Neo4j is required.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_DirectoryMode_DiscoversSolutionAndAllProjectsInOnePass()
+    {
+        var directory = Path.Combine(GetRepoRoot(), "SystemUnderTest");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-dir-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-dir-log-{Guid.NewGuid():N}");
+        try
+        {
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: "none",
+                Projects: null,
+                Directory: directory,
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            var store = new InMemoryTripleStore();
+            await Analyzer.Analyze(config, NullAnalysisProgress.Instance, store);
+
+            var triples = store.Triples;
+
+            // Both projects were discovered and analyzed (project nodes exist).
+            var projectNames = triples
+                .SelectMany(t => new[] { t.NodeA, t.NodeB })
+                .OfType<ProjectNode>()
+                .Select(p => p.Name)
+                .ToHashSet();
+            Assert.Contains("Strazh.Tests.ProjectA", projectNames);
+            Assert.Contains("Strazh.Tests.ProjectB", projectNames);
+
+            // ...and the solution's CONTAINS edges were recorded in the same run.
+            var containedBySolution = triples
+                .OfType<TripleContains>()
+                .Where(t => t.NodeA is SolutionNode s && s.Name == "SystemUnderTest")
+                .Select(t => ((ProjectNode)t.NodeB).Name)
+                .ToHashSet();
+            Assert.Contains("Strazh.Tests.ProjectA", containedBySolution);
+            Assert.Contains("Strazh.Tests.ProjectB", containedBySolution);
+        }
+        finally
+        {
+            foreach (var dir in new[] { cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A directory scan sweeps up every .sln, including ones MSBuild's solution parser rejects
+    /// (e.g. a legacy solution referencing a .vcproj). Such a solution must not abort the whole
+    /// run — it is recorded as a Solution node flagged buildFailed so it is still represented,
+    /// and analysis continues. Uses the in-memory store so no Neo4j is required.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_DirectoryMode_RecordsUnparseableSolutionAsBuildFailed_WithoutAborting()
+    {
+        var scanRoot = Path.Combine(Path.GetTempPath(), $"strazh-badsln-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(scanRoot);
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-badsln-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-badsln-log-{Guid.NewGuid():N}");
+        try
+        {
+            // A solution whose only project is a legacy .vcproj — MSBuild's SolutionFile parser
+            // throws InvalidProjectFileException on it, which is exactly the case that used to
+            // abort the entire directory run.
+            await File.WriteAllTextAsync(Path.Combine(scanRoot, "Legacy.sln"),
+                "Microsoft Visual Studio Solution File, Format Version 12.00\n" +
+                "# Visual Studio Version 17\n" +
+                "Project(\"{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}\") = \"hooks\", \"hooks.vcproj\", " +
+                "\"{2E8F2E4A-1B2C-4D5E-9F00-000000000001}\"\n" +
+                "EndProject\n" +
+                "Global\nEndGlobal\n");
+
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: "none",
+                Projects: null,
+                Directory: scanRoot,
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            var store = new InMemoryTripleStore();
+
+            // Must not throw despite the unparseable solution.
+            await Analyzer.Analyze(config, NullAnalysisProgress.Instance, store);
+
+            var legacy = store.Triples
+                .SelectMany(t => new[] { t.NodeA, t.NodeB })
+                .OfType<SolutionNode>()
+                .FirstOrDefault(s => s.Name == "Legacy");
+            Assert.NotNull(legacy);
+            Assert.True(legacy!.BuildFailed);
+        }
+        finally
+        {
+            foreach (var dir in new[] { scanRoot, cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// End-to-end check that a real analysis emits a per-project metrics report — the same
+    /// pipeline the CLI runs, so the Load-stage timings are real rather than scripted. Confirms
+    /// the report has a line per analyzed project with per-stage timings.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_WritesPerProjectMetricsReport()
+    {
+        var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
+        var cacheDir = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-cache-{Guid.NewGuid():N}");
+        var logDir = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-log-{Guid.NewGuid():N}");
+        var metricsPath = Path.Combine(Path.GetTempPath(), $"strazh-metrics-e2e-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var config = new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "db:user:pass",
+                Tier: "project",
+                Delete: "false",
+                Solution: solutionPath,
+                Projects: Array.Empty<string>(),
+                CacheDirectory: cacheDir,
+                BuildLogDirectory: logDir));
+
+            await Analyzer.Analyze(config, new MetricsAnalysisProgress(metricsPath), new InMemoryTripleStore());
+
+            Assert.True(File.Exists(metricsPath), "metrics report should be written");
+            var lines = await File.ReadAllLinesAsync(metricsPath);
+            Assert.NotEmpty(lines);
+
+            // At least one analyzed project reports per-stage timings and a completed outcome.
+            var sawCompletedWithStages = false;
+            foreach (var line in lines)
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                Assert.False(string.IsNullOrEmpty(root.GetProperty("name").GetString()));
+                if (root.GetProperty("outcome").GetString() == "completed"
+                    && root.GetProperty("stagesMs").EnumerateObject().Any())
+                {
+                    sawCompletedWithStages = true;
+                }
+            }
+            Assert.True(sawCompletedWithStages, "expected at least one completed project with stage timings");
+        }
+        finally
+        {
+            foreach (var dir in new[] { cacheDir, logDir })
+            {
+                if (Directory.Exists(dir))
+                {
+                    try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+                }
+            }
+            if (File.Exists(metricsPath))
+            {
+                File.Delete(metricsPath);
+            }
+        }
     }
 
     // [CallerFilePath] gives the compile-time absolute path of this source file.
