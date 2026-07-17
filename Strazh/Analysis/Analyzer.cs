@@ -653,6 +653,13 @@ namespace Strazh.Analysis
                 // path due to a hash-prefix collision). Fall through to a fresh build.
                 return null;
             }
+            catch (EndOfStreamException)
+            {
+                // Truncated/corrupt cached binlog left over from a prior run. Unlike a freshly-built
+                // binlog this one is not still being written, so re-reading it would not help —
+                // discard it and fall through to a fresh build.
+                return null;
+            }
             if (cached.Any(r => r.Succeeded))
             {
                 // Project references are patched from the Roslyn workspace in the
@@ -758,38 +765,50 @@ namespace Strazh.Analysis
         // when the parent process terminates — that is acceptable.
         private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(5);
         private const int MaxBuildAttempts = 3;
+        // A just-built binlog may not be fully flushed when project.Build() returns; re-read it a few
+        // times with a short delay before giving up and rebuilding (see TryAnalyzeBinlogAsync).
+        private const int MaxBinlogReadAttempts = 3;
+        private static readonly TimeSpan BinlogReadRetryDelay = TimeSpan.FromMilliseconds(500);
         // MD5 produces 32 hex chars; 8 is enough to make collisions negligible across a solution.
         private const int HashPrefixLength = 8;
 
-        // Reads the binlog, retrying once after a short delay if the first attempt yields no
-        // results. The MSBuild child process closes its stdout pipe (causing p.Build() to return)
-        // before the BinaryLogger's file write is guaranteed to be fully flushed to disk. A single
-        // retry covers the common case where the OS buffers have not yet been committed.
-        // Returns all TFM results from the binlog (one per target framework for multi-target projects).
+        // Reads a freshly-built binlog, retrying the read after a short delay while it is not yet
+        // usable. MSBuild's child process closes its stdout pipe (so project.Build() returns) before
+        // the BinaryLogger is guaranteed to have flushed the whole file to disk, so an immediate
+        // replay can yield no results, run off the end of a partial file (EndOfStreamException), or
+        // momentarily not find the file at all (FileNotFoundException — e.g. a concurrent retry
+        // sharing the binlog path deleted it mid-rebuild). All three are transient — the write
+        // finishes, or the sibling rebuild completes, moments later — so we re-read the same binlog
+        // rather than treating it as a failed build. Only once the read retries are exhausted do we
+        // return [], which lets the caller rebuild. Returns all TFM results (one per target framework).
         private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
         {
-            IReadOnlyList<IAnalyzerResult> results;
-            try
+            for (var attempt = 1; attempt <= MaxBinlogReadAttempts; attempt++)
             {
-                results = RealTfmResults(manager.Analyze(binlogPath));
+                try
+                {
+                    var results = RealTfmResults(manager.Analyze(binlogPath));
+                    if (results.Count > 0)
+                    {
+                        return results;
+                    }
+                    // Zero results usually means the binlog's tail has not flushed yet; retry.
+                }
+                catch (FileNotFoundException)
+                {
+                    // Momentarily absent: a concurrent retry sharing this binlog path (hash-prefix
+                    // collision) may have deleted it mid-rebuild. Retry in case it reappears.
+                }
+                catch (EndOfStreamException)
+                {
+                    // Truncated binlog: the BinaryLogger has not finished writing. Retry after a delay.
+                }
+                if (attempt < MaxBinlogReadAttempts)
+                {
+                    await Task.Delay(BinlogReadRetryDelay).ConfigureAwait(false);
+                }
             }
-            catch (FileNotFoundException)
-            {
-                return [];
-            }
-            if (results.Count > 0)
-            {
-                return results;
-            }
-            await Task.Delay(500).ConfigureAwait(false);
-            try
-            {
-                return RealTfmResults(manager.Analyze(binlogPath));
-            }
-            catch (FileNotFoundException)
-            {
-                return [];
-            }
+            return [];
         }
 
         private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut);
