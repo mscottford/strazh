@@ -81,6 +81,17 @@ namespace Strazh.Analysis
         void OnProjectDeferred(string projectFilePath, string filename, string reason);
 
         /// <summary>
+        /// Raised when a non-terminal, self-recovered issue occurs for a project that is worth
+        /// surfacing but does not change the outcome — e.g. a cached binlog was discarded as
+        /// unreadable and the project is being rebuilt. Purely informational: the project is
+        /// neither deferred nor skipped, and its normal lifecycle events still follow.
+        /// </summary>
+        /// <param name="projectFilePath">Absolute path to the project file.</param>
+        /// <param name="filename">Filename of the project.</param>
+        /// <param name="reason">Human-readable description of the issue and the recovery taken.</param>
+        void OnProjectWarning(string projectFilePath, string filename, string reason);
+
+        /// <summary>
         /// Raised when a project cannot be represented at all — not even from fallback data
         /// (e.g. its project file itself could not be read). This is terminal.
         /// </summary>

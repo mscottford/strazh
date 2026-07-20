@@ -149,6 +149,14 @@ namespace Strazh.Analysis
             _active[projectFilePath] = new TaskEntry(name, "deferred", start, now);
         }
 
+        public void OnProjectWarning(string projectFilePath, string filename, string reason)
+        {
+            // Informational only: do not touch the completed count or the active panel — the
+            // project's normal lifecycle events still follow. Printed above the live display.
+            var name = _names.TryGetValue(projectFilePath, out var n) ? n : filename;
+            AnsiConsole.MarkupLine($"[yellow]![/] [bold]{Markup.Escape(name)}[/] ({Markup.Escape(reason)})");
+        }
+
         public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
         {
             Interlocked.Increment(ref _completed);

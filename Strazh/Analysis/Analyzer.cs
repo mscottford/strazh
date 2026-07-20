@@ -100,6 +100,7 @@ namespace Strazh.Analysis
                             OnBuildCompleted = path => progress.OnBuildCompleted(path),
                             OnLoadStarted = path => progress.OnStageChanged(path, GetProjectName(path), "Loading"),
                             OnProjectDeferred = (path, filename, reason) => progress.OnProjectDeferred(path, filename, reason),
+                            OnProjectWarning = (path, filename, reason) => progress.OnProjectWarning(path, filename, reason),
                             OnProjectBuiltButNotLoaded = result => builtButNotLoaded[result.ProjectFilePath] = result
                         },
                         config.CacheDirectory,
@@ -352,6 +353,10 @@ namespace Strazh.Analysis
             // log / not loadable into the workspace). It is not terminal: the project stays pending
             // work and is represented from fallback data after the stream.
             public Action<string, string, string>? OnProjectDeferred { get; init; }
+
+            // A non-terminal, self-recovered issue worth surfacing (e.g. a corrupt cached binlog
+            // discarded and rebuilt). Purely informational — the project's normal events follow.
+            public Action<string, string, string>? OnProjectWarning { get; init; }
 
             // A project whose build succeeded but which could not be loaded into the Roslyn
             // workspace (unsupported project type, or a dangling reference that breaks workspace
@@ -650,14 +655,20 @@ namespace Strazh.Analysis
             {
                 // File.Exists passed but the file was deleted by a concurrent task between the
                 // check and the read (e.g. another project's retry loop sharing the same binlog
-                // path due to a hash-prefix collision). Fall through to a fresh build.
+                // path due to a hash-prefix collision). Report it, then fall through to a fresh build.
+                stage.Callbacks.OnProjectWarning?.Invoke(
+                    state.Identity.Path, state.Identity.FileName,
+                    "cached build log vanished mid-read (concurrent rebuild) — rebuilding");
                 return null;
             }
             catch (EndOfStreamException)
             {
                 // Truncated/corrupt cached binlog left over from a prior run. Unlike a freshly-built
-                // binlog this one is not still being written, so re-reading it would not help —
-                // discard it and fall through to a fresh build.
+                // binlog this one is not still being written, so re-reading it would not help.
+                // Report it, then discard it and fall through to a fresh build.
+                stage.Callbacks.OnProjectWarning?.Invoke(
+                    state.Identity.Path, state.Identity.FileName,
+                    "cached build log was unreadable (truncated) — rebuilding");
                 return null;
             }
             if (cached.Any(r => r.Succeeded))
