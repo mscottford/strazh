@@ -703,7 +703,7 @@ namespace Strazh.Analysis
                 // by StructuredLogger, which handles the current format regardless of
                 // version skew.
                 var binlogExists = File.Exists(state.BinlogPath);
-                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(stage.Manager, state.BinlogPath) : [];
+                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(stage.Manager, state.BinlogPath, stage, state.Identity) : [];
                 if (tfmResults.Any(r => r.Succeeded))
                 {
                     // Write an initial deps sidecar with whatever project references
@@ -790,10 +790,14 @@ namespace Strazh.Analysis
         // momentarily not find the file at all (FileNotFoundException — e.g. a concurrent retry
         // sharing the binlog path deleted it mid-rebuild). All three are transient — the write
         // finishes, or the sibling rebuild completes, moments later — so we re-read the same binlog
-        // rather than treating it as a failed build. Only once the read retries are exhausted do we
-        // return [], which lets the caller rebuild. Returns all TFM results (one per target framework).
-        private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(IAnalyzerManager manager, string binlogPath)
+        // rather than treating it as a failed build. Once the read retries are exhausted we return []
+        // so the caller rebuilds; if the reads kept throwing, that last exception is surfaced via a
+        // project warning (shown in the progress display and written to the file log) rather than
+        // swallowed. Returns all TFM results (one per target framework).
+        private static async Task<IReadOnlyList<IAnalyzerResult>> TryAnalyzeBinlogAsync(
+            IAnalyzerManager manager, string binlogPath, BuildStageContext stage, ProjectIdentity identity)
         {
+            string? lastReadError = null;
             for (var attempt = 1; attempt <= MaxBinlogReadAttempts; attempt++)
             {
                 try
@@ -803,21 +807,33 @@ namespace Strazh.Analysis
                     {
                         return results;
                     }
-                    // Zero results usually means the binlog's tail has not flushed yet; retry.
+                    // Zero results without an error usually means the binlog's tail has not flushed
+                    // yet; retry. An empty-but-readable log is a normal outcome (handled by a rebuild),
+                    // so it is not surfaced as a warning.
                 }
-                catch (FileNotFoundException)
+                catch (FileNotFoundException exception)
                 {
                     // Momentarily absent: a concurrent retry sharing this binlog path (hash-prefix
                     // collision) may have deleted it mid-rebuild. Retry in case it reappears.
+                    lastReadError = $"binlog not found ({exception.Message})";
                 }
-                catch (EndOfStreamException)
+                catch (EndOfStreamException exception)
                 {
                     // Truncated binlog: the BinaryLogger has not finished writing. Retry after a delay.
+                    lastReadError = $"binlog truncated ({exception.Message})";
                 }
                 if (attempt < MaxBinlogReadAttempts)
                 {
                     await Task.Delay(BinlogReadRetryDelay).ConfigureAwait(false);
                 }
+            }
+            // Read retries exhausted. If the reads kept throwing, surface the last exception (progress
+            // warning + file log) instead of swallowing it; the caller still falls back to a rebuild.
+            if (lastReadError != null)
+            {
+                stage.Callbacks.OnProjectWarning?.Invoke(
+                    identity.Path, identity.FileName,
+                    $"could not read build log after {MaxBinlogReadAttempts} attempts — {lastReadError}; rebuilding");
             }
             return [];
         }
