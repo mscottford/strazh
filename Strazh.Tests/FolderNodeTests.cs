@@ -51,4 +51,32 @@ public class FolderNodeTests
         Assert.Equal("Submodule",
             new FolderNode("host/Core", "Core", FolderKind.Submodule).Properties()["kind"]);
     }
+
+    // A folder present at two source commits must be two distinct nodes, and the commit sha
+    // composes with (rather than replaces) the kind that already participates in identity.
+    [Fact]
+    public void Pk_FoldsInCommitShaAlongsideKind()
+    {
+        var regularAtA = new FolderNode("repo/src", "src", commitSha: "sha1");
+        var regularAtB = new FolderNode("repo/src", "src", commitSha: "sha2");
+        var regularUnversioned = new FolderNode("repo/src", "src");
+        var submoduleAtA = new FolderNode("repo/src", "src", FolderKind.Submodule, "sha1");
+
+        Assert.NotEqual(regularAtA.Pk, regularAtB.Pk);
+        Assert.NotEqual(regularUnversioned.Pk, regularAtA.Pk);
+        Assert.NotEqual(regularAtA.Pk, submoduleAtA.Pk);
+        Assert.Equal(regularAtA.Pk, new FolderNode("repo/src", "src", commitSha: "sha1").Pk);
+    }
+
+    [Fact]
+    public void CommitSha_EmittedWhenPresent_OmittedWhenNull()
+    {
+        var versioned = new FolderNode("repo/src", "src", commitSha: "abc123");
+        Assert.Contains("f.commitSha = \"abc123\"", versioned.Set("f"));
+        Assert.Equal("abc123", versioned.Properties()["commitSha"]);
+
+        var plain = new FolderNode("repo/src", "src");
+        Assert.DoesNotContain("commitSha", plain.Set("f"));
+        Assert.DoesNotContain("commitSha", plain.Properties().Keys);
+    }
 }

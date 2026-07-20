@@ -182,11 +182,11 @@ namespace Strazh.Domain
 
     public class FolderNode : Node
     {
-        public FolderNode(string fullName, string name)
-            : this(fullName, name, FolderKind.Regular) { }
+        public FolderNode(string fullName, string name, string? commitSha = null)
+            : this(fullName, name, FolderKind.Regular, commitSha) { }
 
-        public FolderNode(string fullName, string name, FolderKind kind)
-            : base(fullName, name)
+        public FolderNode(string fullName, string name, FolderKind kind, string? commitSha = null)
+            : base(fullName, name, commitSha)
         {
             Kind = kind;
             SetPrimaryKey();
@@ -198,7 +198,9 @@ namespace Strazh.Domain
 
         // Kind is part of the PK so two folders at the same path with different kinds
         // (e.g. a Regular folder created by the file chain vs. a Submodule mount-point
-        // node) are distinct nodes in the graph rather than colliding on MERGE.
+        // node) are distinct nodes in the graph rather than colliding on MERGE. The commit
+        // sha (via ScopedKey) also participates, so a folder present at two source commits
+        // becomes two distinct nodes rather than the later scan clobbering the earlier one.
         protected override void SetPrimaryKey()
         {
             Pk = DeterministicHash(ScopedKey($"{FullName}|{Kind}"));
@@ -221,14 +223,15 @@ namespace Strazh.Domain
         }
     }
 
-    public class SolutionNode(string name, bool buildFailed = false) : Node(name, name)
+    public class SolutionNode(string name, bool buildFailed = false, string? commitSha = null)
+        : Node(name, name, commitSha)
     {
         public override string Label => "Solution";
 
         /// <summary>True when the solution file could not be parsed/loaded — e.g. it references
         /// a project type MSBuild no longer supports (a legacy .vcproj) — so its membership could
         /// not be analyzed. buildFailed is not part of the pk, so a flagged node MERGEs onto the
-        /// same Solution as an unflagged one of the same name.</summary>
+        /// same Solution as an unflagged one of the same name (and commit).</summary>
         public bool BuildFailed { get; } = buildFailed;
 
         // Emitted only when notable, so normally-loaded solutions stay clean.

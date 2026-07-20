@@ -141,10 +141,20 @@ public class ExtractorTests
         var file = triples.Select(t => t.NodeB).OfType<FileNode>().First(f => f.Name == "Widget.cs");
         Assert.Equal(repo.Head, file.CommitSha);
 
+        // The folders on the file's chain are versioned by the same commit as the file.
+        var srcFolder = triples.Select(t => t.NodeB).OfType<FolderNode>().First(f => f.Name == "src");
+        Assert.Equal(repo.Head, srcFolder.CommitSha);
+
         // FROM_COMMIT links the declared class to a Commit node carrying that sha.
         Assert.Contains(triples, t =>
             t.Relationship.Type == "FROM_COMMIT"
             && t.NodeA is ClassNode { Name: "Widget" }
+            && t.NodeB is CommitNode commit && commit.Sha == repo.Head);
+
+        // ...and each folder on the chain is linked to that commit too.
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "FROM_COMMIT"
+            && t.NodeA is FolderNode { Name: "src" }
             && t.NodeB is CommitNode commit && commit.Sha == repo.Head);
     }
 

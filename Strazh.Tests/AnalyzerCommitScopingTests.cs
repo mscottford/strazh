@@ -54,6 +54,17 @@ public class AnalyzerCommitScopingTests
             t.Relationship.Type == "FROM_COMMIT"
             && t.NodeA is ProjectNode
             && t.NodeB is CommitNode commit && commit.Sha == fixture.Head);
+
+        // The structural Solution and Folder nodes are versioned by HEAD and linked to the
+        // Commit node too, so the same solution/folder at another commit is a distinct subgraph.
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "FROM_COMMIT"
+            && t.NodeA is SolutionNode solution && solution.CommitSha == fixture.Head
+            && t.NodeB is CommitNode commit && commit.Sha == fixture.Head);
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "FROM_COMMIT"
+            && t.NodeA is FolderNode folder && folder.CommitSha == fixture.Head
+            && t.NodeB is CommitNode commit && commit.Sha == fixture.Head);
     }
 
     /// <summary>

@@ -209,6 +209,30 @@ public class NodeTests
         Assert.NotEqual(
             new ProjectNode("Repo.Lib", "Repo.Lib").Pk,
             new ProjectNode("Repo.Lib", "Repo.Lib", commitSha: "sha1").Pk);
+        // The structural Solution and Folder nodes are now versioned too.
+        Assert.NotEqual(
+            new SolutionNode("App").Pk,
+            new SolutionNode("App", commitSha: "sha1").Pk);
+        Assert.NotEqual(
+            new FolderNode("repo/src", "src").Pk,
+            new FolderNode("repo/src", "src", commitSha: "sha1").Pk);
+    }
+
+    [Fact]
+    public void SolutionNode_CommitShaFoldsIntoPkAndIsEmitted()
+    {
+        var atA = new SolutionNode("App", commitSha: "sha1");
+        var atB = new SolutionNode("App", commitSha: "sha2");
+
+        // Same solution at two commits -> two distinct nodes; stable within a commit.
+        Assert.NotEqual(atA.Pk, atB.Pk);
+        Assert.NotEqual(new SolutionNode("App").Pk, atA.Pk);
+        Assert.Equal(atA.Pk, new SolutionNode("App", commitSha: "sha1").Pk);
+        // buildFailed still is not part of identity, even when the node is versioned.
+        Assert.Equal(atA.Pk, new SolutionNode("App", buildFailed: true, commitSha: "sha1").Pk);
+
+        Assert.Contains("s.commitSha = \"sha1\"", atA.Set("s"));
+        Assert.Equal("sha1", atA.Properties()["commitSha"]);
     }
 
     [Fact]

@@ -90,9 +90,13 @@ namespace Strazh.Analysis
         private static string GetName(string filePath)
             => filePath.Split(Path.DirectorySeparatorChar)[^1];
 
-        private static List<TripleIncludedIn> GetFolderChain(string filePath, FileNode file)
+        // Builds the file's INCLUDED_IN folder chain, versioning every folder by the file's commit
+        // (so a folder present at two commits is two distinct nodes) and linking each to the commit
+        // via FROM_COMMIT when one was resolved. commit is null for files outside a git repo, leaving
+        // the folders unversioned and emitting no FROM_COMMIT.
+        private static List<Triple> GetFolderChain(string filePath, FileNode file, string? commitSha, CommitNode? commit)
         {
-            var triples = new List<TripleIncludedIn>();
+            var triples = new List<Triple>();
             var chain = filePath.Split(Path.DirectorySeparatorChar);
             FolderNode? prev = null;
             var path = string.Empty;
@@ -101,7 +105,8 @@ namespace Strazh.Analysis
                 if (string.IsNullOrEmpty(path))
                 {
                     path = item;
-                    prev = new FolderNode(path, item);
+                    prev = new FolderNode(path, item, commitSha);
+                    AddFolderCommit(triples, prev, commit);
                     continue;
                 }
                 if (item == file.Name)
@@ -113,11 +118,22 @@ namespace Strazh.Analysis
                 else
                 {
                     path = Path.DirectorySeparatorChar == '/' ? $"{path}/{item}" : $"{path}\\{item}";
-                    triples.Add(new TripleIncludedIn(new FolderNode(path, item), new FolderNode(prev!.FullName, prev.Name)));
-                    prev = new FolderNode(path, item);
+                    var current = new FolderNode(path, item, commitSha);
+                    triples.Add(new TripleIncludedIn(current, new FolderNode(prev!.FullName, prev.Name, commitSha)));
+                    AddFolderCommit(triples, current, commit);
+                    prev = current;
                 }
             }
             return triples;
+        }
+
+        // Emits FROM_COMMIT for a folder on the chain, once, when the file's commit was resolved.
+        private static void AddFolderCommit(List<Triple> triples, FolderNode folder, CommitNode? commit)
+        {
+            if (commit != null)
+            {
+                triples.Add(new TripleFromCommit(folder, commit));
+            }
         }
 
         /// <summary>
@@ -140,7 +156,10 @@ namespace Strazh.Analysis
             var fileSha = fileCommit?.Sha;
 
             var fileNode = new FileNode(filePath, fileName, fileSha);
-            GetFolderChain(filePath, fileNode).ForEach(triples.Add);
+            foreach (var triple in GetFolderChain(filePath, fileNode, fileSha, fileCommit))
+            {
+                triples.Add(triple);
+            }
             if (fileCommit != null)
             {
                 triples.Add(new TripleFromCommit(fileNode, fileCommit));
