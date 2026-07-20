@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -42,7 +43,8 @@ public class AnalyzerSubmoduleTests
 
         var triples = store.Triples;
 
-        // A Submodule-kind Folder exists at "<host-repo-folder>/Core".
+        // A Submodule-kind Folder exists at "<host-repo-folder>/Core" (discovered from .gitmodules,
+        // which does not require a checkout — so this holds even though the fake fixture has no HEAD).
         var mountFolder = triples
             .Select(t => t.NodeA)
             .OfType<FolderNode>()
@@ -51,18 +53,17 @@ public class AnalyzerSubmoduleTests
         Assert.NotNull(mountFolder);
         Assert.Equal("host-repo/Core", mountFolder.FullName);
 
-        // It's INCLUDED_IN the referenced Repository (the submodule's resolved owner/repo).
-        Assert.Contains(triples, t =>
-            t.NodeA is FolderNode a && a.Pk == mountFolder.Pk
-            && t.NodeB is RepositoryNode r && r.FullName == "TestOrg/core-repo"
-            && t.Relationship.Type == "INCLUDED_IN");
-
-        // It's also INCLUDED_IN the host's repo-root folder, so the host's tree can
-        // reach the mount point via folder traversal.
+        // It's INCLUDED_IN the host's repo-root folder, so the host's tree can reach the mount
+        // point via folder traversal.
         Assert.Contains(triples, t =>
             t.NodeA is FolderNode a && a.Pk == mountFolder.Pk
             && t.NodeB is FolderNode b && b.Name == "host-repo" && b.Kind == FolderKind.Regular
             && t.Relationship.Type == "INCLUDED_IN");
+
+        // No folder is linked directly to a Repository anymore — a folder's repository is
+        // discovered transitively through its commit (folder -FROM-> Commit <-HAS- Repository).
+        Assert.DoesNotContain(triples, t =>
+            t.NodeB is RepositoryNode && t.Relationship.Type == "INCLUDED_IN");
     }
 
     [Fact]
@@ -90,6 +91,47 @@ public class AnalyzerSubmoduleTests
             .Any(f => f.Kind == FolderKind.Submodule);
 
         Assert.False(anySubmoduleFolder);
+    }
+
+    /// <summary>
+    /// End-to-end against a REAL submodule checkout: a host repo (containing the SystemUnderTest
+    /// solution) pins a core repo as a submodule at "Core". After analysis the submodule mount
+    /// folder must PINS the core repo's pinned commit, and that commit must be owned by the core
+    /// repository via HAS — so the submodule's repository is reachable through the pinned commit
+    /// even though no folder links to it directly.
+    /// </summary>
+    [Fact]
+    public async Task Analyze_RealSubmodule_PinsMountFolderToCommitOwnedByItsRepository()
+    {
+        using var fixture = new RealSubmoduleFixture();
+
+        var store = new InMemoryTripleStore();
+        await Analyzer.Analyze(
+            new AnalyzerConfig(new AnalyzerConfig.Options(
+                Credentials: "",
+                Tier: "project",
+                Delete: "false",
+                Solution: fixture.SolutionPath,
+                Projects: Array.Empty<string>())),
+            NullAnalysisProgress.Instance,
+            store);
+
+        var triples = store.Triples;
+
+        // The submodule mount folder PINS the core repo's pinned commit.
+        var pin = triples.FirstOrDefault(t =>
+            t.Relationship.Type == "PINS"
+            && t.NodeA is FolderNode { Kind: FolderKind.Submodule }
+            && t.NodeB is CommitNode c && c.Sha == fixture.PinnedCoreSha);
+        Assert.NotNull(pin);
+
+        // That pinned commit is attributed to the core repository (not the host) via HAS.
+        var pinnedCommit = (CommitNode)pin.NodeB;
+        Assert.EndsWith("Org/core", pinnedCommit.Repo);
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "HAS"
+            && t.NodeA is RepositoryNode r && r.FullName == pinnedCommit.Repo
+            && t.NodeB is CommitNode c && c.Sha == fixture.PinnedCoreSha);
     }
 
     /// <summary>
@@ -164,5 +206,138 @@ public class AnalyzerSubmoduleTests
 
         private static string GetThisDir([CallerFilePath] string callerFile = "")
             => Path.GetDirectoryName(callerFile)!;
+    }
+
+    /// <summary>
+    /// Builds a real host repo that pins a real core repo as a submodule at "Core", using the git
+    /// CLI over file:// remotes (the same layout <see cref="GitHelperIntegrationTests"/> uses). The
+    /// host contains the SystemUnderTest solution so <see cref="Analyzer.Analyze"/> has projects to
+    /// build. Exposes the solution path and the pinned core commit sha.
+    ///
+    /// Requires git on PATH and the ability to build SystemUnderTest (as the other Analyzer tests do).
+    /// </summary>
+    private sealed class RealSubmoduleFixture : IDisposable
+    {
+        public string Root { get; }
+        public string SolutionPath { get; }
+        public string PinnedCoreSha { get; }
+
+        public RealSubmoduleFixture()
+        {
+            Root = Path.Combine(Path.GetTempPath(), $"strazh-realsub-{Guid.NewGuid():N}");
+            var bareRoot = Path.Combine(Root, "bare");
+            var workRoot = Path.Combine(Root, "work");
+            Directory.CreateDirectory(bareRoot);
+            Directory.CreateDirectory(workRoot);
+
+            var bareCore = Path.Combine(bareRoot, "Org", "core.git");
+            var bareHost = Path.Combine(bareRoot, "Org", "host.git");
+            Directory.CreateDirectory(bareCore);
+            Directory.CreateDirectory(bareHost);
+            Git(bareRoot, "init", "--bare", "--initial-branch=main", bareCore);
+            Git(bareRoot, "init", "--bare", "--initial-branch=main", bareHost);
+
+            // Seed the core repo with one commit so it can be pinned as a submodule.
+            var coreSeed = Clone(workRoot, bareCore, "core-seed");
+            File.WriteAllText(Path.Combine(coreSeed, "README.md"), "core");
+            Git(coreSeed, "add", "-A");
+            Git(coreSeed, "commit", "-m", "core v1");
+            Git(coreSeed, "push", "origin", "HEAD:refs/heads/main");
+
+            // Seed the host with the SystemUnderTest solution, then pin core as a submodule via a
+            // relative URL that resolves against the host's origin (matching real git semantics).
+            var hostSeed = Clone(workRoot, bareHost, "host-seed");
+            CopyDirectory(Path.Combine(GetThisDir(), "..", "SystemUnderTest"), hostSeed);
+            Git(hostSeed, "add", "-A");
+            Git(hostSeed, "commit", "-m", "seed SystemUnderTest");
+            Git(hostSeed, "-c", "protocol.file.allow=always",
+                "submodule", "add", "../core.git", "Core");
+            Git(hostSeed, "commit", "-m", "add Core submodule");
+            Git(hostSeed, "push", "origin", "HEAD:refs/heads/main");
+
+            // Final recursive clone: the layout the analyzer sees, with Core checked out at the pin.
+            var final = Path.Combine(workRoot, "final");
+            Git(workRoot, "-c", "protocol.file.allow=always",
+                "clone", "--recursive", FileUrl(bareHost), final);
+
+            PinnedCoreSha = Exec(Path.Combine(final, "Core"), capture: true, "rev-parse", "HEAD");
+            SolutionPath = Path.Combine(final, "SystemUnderTest.sln");
+        }
+
+        private static string Clone(string workRoot, string bareRepoPath, string workdirName)
+        {
+            var dest = Path.Combine(workRoot, workdirName);
+            Git(workRoot, "clone", FileUrl(bareRepoPath), dest);
+            Git(dest, "config", "user.email", "test@strazh.invalid");
+            Git(dest, "config", "user.name", "Strazh Test");
+            return dest;
+        }
+
+        private static string FileUrl(string path) => "file://" + path.Replace('\\', '/');
+
+        private static void Git(string workingDir, params string[] args) => Exec(workingDir, capture: false, args);
+
+        private static string Exec(string workingDir, bool capture, params string[] args)
+        {
+            var psi = new ProcessStartInfo("git")
+            {
+                WorkingDirectory = workingDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in args)
+            {
+                psi.ArgumentList.Add(a);
+            }
+            using var p = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start git");
+            var stdout = p.StandardOutput.ReadToEnd();
+            var stderr = p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            if (p.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"git {string.Join(" ", args)} failed (exit={p.ExitCode})\nstderr: {stderr}");
+            }
+            return capture ? stdout.Trim() : stdout;
+        }
+
+        private static void CopyDirectory(string source, string destination)
+        {
+            Directory.CreateDirectory(destination);
+            foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
+            {
+                Directory.CreateDirectory(dir.Replace(source, destination));
+            }
+            foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+            {
+                if (file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")
+                    || file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}"))
+                {
+                    continue;
+                }
+                File.Copy(file, file.Replace(source, destination), overwrite: true);
+            }
+        }
+
+        private static string GetThisDir([CallerFilePath] string callerFile = "")
+            => Path.GetDirectoryName(callerFile)!;
+
+        public void Dispose()
+        {
+            if (!Directory.Exists(Root))
+            {
+                return;
+            }
+            try
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; .git objects can be read-only on some platforms.
+            }
+        }
     }
 }

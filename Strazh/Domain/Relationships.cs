@@ -46,4 +46,25 @@ namespace Strazh.Domain
     {
         public override string Type => "CONTAINS";
     }
+
+    // Links a versioned code/structure node to the git commit it was analyzed from.
+    public class FromRelationship : Relationship
+    {
+        public override string Type => "FROM";
+    }
+
+    // Links a repository to a commit that belongs to it. This is the only edge a Repository
+    // node participates in: a node's owning repository is discovered transitively as
+    // (node)-[:FROM]->(:Commit)<-[:HAS]-(:Repository).
+    public class HasRelationship : Relationship
+    {
+        public override string Type => "HAS";
+    }
+
+    // Links a folder to a commit it pins — a submodule mount point and the submodule's
+    // checked-out (pinned) commit.
+    public class PinsRelationship : Relationship
+    {
+        public override string Type => "PINS";
+    }
 }

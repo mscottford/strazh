@@ -19,16 +19,39 @@ namespace Strazh.Domain
         /// </summary>
         public virtual string Pk { get; protected set; } = "";
 
-        public Node(string fullName, string name)
+        public Node(string fullName, string name, string? commitSha = null)
         {
             FullName = fullName;
             Name = name;
+            CommitSha = commitSha;
             SetPrimaryKey();
         }
 
+        /// <summary>
+        /// The commit sha of the source version this node belongs to, or null for the
+        /// version-agnostic Repository and Commit nodes (a Repository owns commits; a Commit's
+        /// identity is its own sha). When set, it is folded into the pk — so the same logical node
+        /// checked out at two different commits becomes two distinct graph nodes rather than
+        /// colliding on MERGE — but it is not written as a property; the version link is the
+        /// <c>FROM</c> edge to the Commit node.
+        /// </summary>
+        public string? CommitSha { get; }
+
+        // Prefixes a node's identity string with its commit sha (when versioned) so otherwise
+        // identical logical nodes from different checked-out commits get distinct pks. A sha is
+        // fixed-format hex, so the first space unambiguously delimits it from the key that follows.
+        protected string ScopedKey(string key)
+            => string.IsNullOrEmpty(CommitSha) ? key : $"{CommitSha} {key}";
+
+        // Escapes a string for embedding in a double-quoted Cypher literal on the raw Set() path
+        // (used by inspection/tests). Free-text values (a commit author or subject) can contain
+        // quotes or backslashes; the production write path binds them as parameters instead.
+        protected static string EscapeForCypher(string value)
+            => value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace('\n', ' ').Replace('\r', ' ');
+
         protected virtual void SetPrimaryKey()
         {
-            Pk = DeterministicHash(FullName);
+            Pk = DeterministicHash(ScopedKey(FullName));
         }
 
         // string.GetHashCode() is randomized per-process in .NET Core and later, so using it
@@ -41,8 +64,8 @@ namespace Strazh.Domain
             return Convert.ToHexString(bytes);
         }
 
-        public virtual string Set(string node) =>
-            $"{node}.pk = \"{Pk}\", {node}.fullName = \"{FullName}\", {node}.name = \"{Name}\"";
+        public virtual string Set(string node)
+            => $"{node}.pk = \"{Pk}\", {node}.fullName = \"{FullName}\", {node}.name = \"{Name}\"";
 
         /// <summary>
         /// The node's properties as a parameter map, used by the batched, parameterized
@@ -65,7 +88,8 @@ namespace Strazh.Domain
 
     // Code
 
-    public abstract class CodeNode(string fullName, string name, string[]? modifiers = null) : Node(fullName, name)
+    public abstract class CodeNode(string fullName, string name, string[]? modifiers = null, string? commitSha = null)
+        : Node(fullName, name, commitSha)
     {
         public string Modifiers { get; } = modifiers == null ? "" : string.Join(", ", modifiers);
 
@@ -83,25 +107,25 @@ namespace Strazh.Domain
         }
     }
 
-    public abstract class TypeNode(string fullName, string name, string[]? modifiers = null)
-        : CodeNode(fullName, name, modifiers);
+    public abstract class TypeNode(string fullName, string name, string[]? modifiers = null, string? commitSha = null)
+        : CodeNode(fullName, name, modifiers, commitSha);
 
-    public class ClassNode(string fullName, string name, string[]? modifiers = null)
-        : TypeNode(fullName, name, modifiers)
+    public class ClassNode(string fullName, string name, string[]? modifiers = null, string? commitSha = null)
+        : TypeNode(fullName, name, modifiers, commitSha)
     {
         public override string Label { get; } = "Class";
     }
 
-    public class InterfaceNode(string fullName, string name, string[]? modifiers = null)
-        : TypeNode(fullName, name, modifiers)
+    public class InterfaceNode(string fullName, string name, string[]? modifiers = null, string? commitSha = null)
+        : TypeNode(fullName, name, modifiers, commitSha)
     {
         public override string Label { get; } = "Interface";
     }
 
     public class MethodNode : CodeNode
     {
-        public MethodNode(string fullName, string name, (string name, string type)[] args, string returnType, string[]? modifiers = null)
-            : base(fullName, name, modifiers)
+        public MethodNode(string fullName, string name, (string name, string type)[] args, string returnType, string[]? modifiers = null, string? commitSha = null)
+            : base(fullName, name, modifiers, commitSha)
         {
             Arguments = string.Join(", ", args.Select(x => $"{x.type} {x.name}"));
             ReturnType = returnType;
@@ -127,13 +151,13 @@ namespace Strazh.Domain
 
         protected override void SetPrimaryKey()
         {
-            Pk = DeterministicHash($"{FullName}{Arguments}{ReturnType}");
+            Pk = DeterministicHash(ScopedKey($"{FullName}{Arguments}{ReturnType}"));
         }
     }
 
     // Structure
 
-    public class FileNode(string fullName, string name) : Node(fullName, name)
+    public class FileNode(string fullName, string name, string? commitSha = null) : Node(fullName, name, commitSha)
     {
         public override string Label { get; } = "File";
     }
@@ -146,11 +170,11 @@ namespace Strazh.Domain
 
     public class FolderNode : Node
     {
-        public FolderNode(string fullName, string name)
-            : this(fullName, name, FolderKind.Regular) { }
+        public FolderNode(string fullName, string name, string? commitSha = null)
+            : this(fullName, name, FolderKind.Regular, commitSha) { }
 
-        public FolderNode(string fullName, string name, FolderKind kind)
-            : base(fullName, name)
+        public FolderNode(string fullName, string name, FolderKind kind, string? commitSha = null)
+            : base(fullName, name, commitSha)
         {
             Kind = kind;
             SetPrimaryKey();
@@ -162,10 +186,12 @@ namespace Strazh.Domain
 
         // Kind is part of the PK so two folders at the same path with different kinds
         // (e.g. a Regular folder created by the file chain vs. a Submodule mount-point
-        // node) are distinct nodes in the graph rather than colliding on MERGE.
+        // node) are distinct nodes in the graph rather than colliding on MERGE. The commit
+        // sha (via ScopedKey) also participates, so a folder present at two source commits
+        // becomes two distinct nodes rather than the later scan clobbering the earlier one.
         protected override void SetPrimaryKey()
         {
-            Pk = DeterministicHash($"{FullName}|{Kind}");
+            Pk = DeterministicHash(ScopedKey($"{FullName}|{Kind}"));
         }
 
         // Only write kind when non-default to keep the property set clean on regular folders.
@@ -185,14 +211,15 @@ namespace Strazh.Domain
         }
     }
 
-    public class SolutionNode(string name, bool buildFailed = false) : Node(name, name)
+    public class SolutionNode(string name, bool buildFailed = false, string? commitSha = null)
+        : Node(name, name, commitSha)
     {
         public override string Label => "Solution";
 
         /// <summary>True when the solution file could not be parsed/loaded — e.g. it references
         /// a project type MSBuild no longer supports (a legacy .vcproj) — so its membership could
         /// not be analyzed. buildFailed is not part of the pk, so a flagged node MERGEs onto the
-        /// same Solution as an unflagged one of the same name.</summary>
+        /// same Solution as an unflagged one of the same name (and commit).</summary>
         public bool BuildFailed { get; } = buildFailed;
 
         // Emitted only when notable, so normally-loaded solutions stay clean.
@@ -210,8 +237,8 @@ namespace Strazh.Domain
         }
     }
 
-    public class ProjectNode(string fullName, string name, string[]? targetFrameworks = null, bool exists = true, bool buildFailed = false)
-        : Node(fullName, name)
+    public class ProjectNode(string fullName, string name, string[]? targetFrameworks = null, bool exists = true, bool buildFailed = false, string? commitSha = null)
+        : Node(fullName, name, commitSha)
     {
         public ProjectNode(string name)
             : this(name, name) { }
@@ -299,7 +326,64 @@ namespace Strazh.Domain
 
         protected override void SetPrimaryKey()
         {
-            Pk = DeterministicHash($"{FullName}{Version}");
+            Pk = DeterministicHash(ScopedKey($"{FullName}{Version}"));
+        }
+    }
+
+    /// <summary>
+    /// A git commit that a set of code/structure nodes was analyzed from. Its identity is the sha.
+    /// It is the version hub: versioned nodes point at it via FROM, the owning repository points at
+    /// it via HAS, and a submodule mount-point folder points at the commit it pins via PINS. Carries
+    /// the metadata needed to identify and date the version.
+    /// </summary>
+    public class CommitNode : Node
+    {
+        public CommitNode(
+            string sha,
+            string repo,
+            string authoredDate,
+            string committedDate,
+            string author,
+            string subject)
+            : base(sha, sha)
+        {
+            Sha = sha;
+            Repo = repo;
+            AuthoredDate = authoredDate;
+            CommittedDate = committedDate;
+            Author = author;
+            Subject = subject;
+        }
+
+        public override string Label { get; } = "Commit";
+
+        public string Sha { get; }
+
+        public string Repo { get; }
+
+        public string AuthoredDate { get; }
+
+        public string CommittedDate { get; }
+
+        public string Author { get; }
+
+        public string Subject { get; }
+
+        public override string Set(string node)
+            => $"{base.Set(node)}, {node}.sha = \"{Sha}\", {node}.repo = \"{EscapeForCypher(Repo)}\""
+             + $", {node}.authoredDate = \"{AuthoredDate}\", {node}.committedDate = \"{CommittedDate}\""
+             + $", {node}.author = \"{EscapeForCypher(Author)}\", {node}.subject = \"{EscapeForCypher(Subject)}\"";
+
+        public override IDictionary<string, object> Properties()
+        {
+            var properties = base.Properties();
+            properties["sha"] = Sha;
+            properties["repo"] = Repo;
+            properties["authoredDate"] = AuthoredDate;
+            properties["committedDate"] = CommittedDate;
+            properties["author"] = Author;
+            properties["subject"] = Subject;
+            return properties;
         }
     }
 }
