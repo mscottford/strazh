@@ -96,4 +96,16 @@ namespace Strazh.Domain
             : base(interfaceA, interfaceB, new OfTypeRelationship())
         { }
     }
+
+    // Version provenance
+
+    // A versioned node (Project / File / Class / Interface / Method) and the commit it came from.
+    public class TripleFromCommit(
+        Node node,
+        CommitNode commit) : Triple(node, commit, new FromCommitRelationship());
+
+    // A repository and a commit it pins (e.g. the commit a submodule is checked out at).
+    public class TriplePins(
+        RepositoryNode repository,
+        CommitNode commit) : Triple(repository, commit, new PinsRelationship());
 }

@@ -1091,6 +1091,18 @@ namespace Strazh.Analysis
                         FolderKind.Submodule);
                     triples.Add(new TripleIncludedIn(mountFolder, solutionRepoFolder));
                     triples.Add(new TripleIncludedIn(mountFolder, new RepositoryNode(sub.RepositoryName)));
+
+                    // Record which commit the host repo pins the submodule to. The mount directory's
+                    // HEAD is the pinned (detached) commit; solutionRepoName is guaranteed non-null
+                    // inside this block. Redundant across a repo's projects, but MERGE dedupes it.
+                    if (solutionGitRoot != null && solutionRepoName != null)
+                    {
+                        var pinnedCommit = GitHelper.GetCommitNode(Path.Combine(solutionGitRoot, sub.MountPath));
+                        if (pinnedCommit != null)
+                        {
+                            triples.Add(new TriplePins(new RepositoryNode(solutionRepoName), pinnedCommit));
+                        }
+                    }
                 }
             }
 
@@ -1120,7 +1132,10 @@ namespace Strazh.Analysis
                 }
             }
 
-            var projectNode = new ProjectNode(projectName);
+            // Version the CONTAINS target by the project's commit so it MERGEs onto the same node
+            // BuildProjectTriples produces (which also carries the target frameworks and FROM_COMMIT).
+            var projectSha = projectPath != null ? GitHelper.GetCommit(projectPath)?.Sha : null;
+            var projectNode = new ProjectNode(projectName, projectName, commitSha: projectSha);
             triples.Add(new TripleContains(solutionNode, projectNode));
 
             return triples;
@@ -1182,6 +1197,12 @@ namespace Strazh.Analysis
             var root = GetRoot(path);
             var rootNode = new FolderNode(root, root);
 
+            // The project is versioned by its own git root's HEAD, so copies of the same project at
+            // different commits become distinct nodes. FROM_COMMIT is emitted here (the guaranteed
+            // per-project path) so it fires exactly once per represented project.
+            var projectCommit = GitHelper.GetCommitNode(path);
+            var projectSha = projectCommit?.Sha;
+
             var analyzer = result.Analyzer ?? result.Manager?.GetProject(IOPath.Parse(path));
             var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
             if (targetFrameworks.Length == 0 && !string.IsNullOrEmpty(result.TargetFramework))
@@ -1193,12 +1214,19 @@ namespace Strazh.Analysis
             // (RealTfmResults forwards only succeeded builds), and marking it here would mismark a
             // multi-target project when one TFM fails but another succeeds. buildFailed is decided
             // per project by the fallback sweep, which runs only when no build succeeded at all.
-            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
+            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks, commitSha: projectSha);
             triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            if (projectCommit != null)
+            {
+                triples.Add(new TripleFromCommit(projectNode, projectCommit));
+            }
             result.ProjectReferences.ToList().ForEach(x =>
             {
                 var refName = GetProjectName(x);
-                triples.Add(new TripleDependsOnProject(projectNode, new ProjectNode(refName, refName, null, File.Exists(x))));
+                // Version the reference target by the referenced project's own commit, so it MERGEs
+                // onto the same node that project produces when it is itself analyzed.
+                var refSha = GitHelper.GetCommit(x)?.Sha;
+                triples.Add(new TripleDependsOnProject(projectNode, new ProjectNode(refName, refName, null, File.Exists(x), commitSha: refSha)));
             });
             result.PackageReferences.ToList().ForEach(x =>
             {
@@ -1220,8 +1248,13 @@ namespace Strazh.Analysis
             var root = GetRoot(projectFile.Path);
             var rootNode = new FolderNode(root, root);
 
-            var projectNode = new ProjectNode(projectName, projectName, projectFile.TargetFrameworks, exists: true, buildFailed: true);
+            var projectCommit = GitHelper.GetCommitNode(projectFile.Path);
+            var projectNode = new ProjectNode(projectName, projectName, projectFile.TargetFrameworks, exists: true, buildFailed: true, commitSha: projectCommit?.Sha);
             triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            if (projectCommit != null)
+            {
+                triples.Add(new TripleFromCommit(projectNode, projectCommit));
+            }
             foreach (var package in projectFile.PackageReferences)
             {
                 var version = string.IsNullOrEmpty(package.Version) ? "none" : package.Version;
