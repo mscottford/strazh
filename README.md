@@ -16,3 +16,13 @@ More details in the article [Codebase Knowledge Graph](https://vladbatushkov.med
 [Manual run](/Documentation/manual-run.md)
 
 [Command Line Interface](/Documentation/cli.md)
+
+#### Development
+
+`progress-harness.cs` is a standalone [file-based app](https://learn.microsoft.com/en-us/dotnet/core/sdk/file-based-apps) that drives the console progress display (`SpectreConsoleProgress`) with a simulated analysis workload — a concurrent build/load/insert pipeline with completions scrolling, a deferred-then-recorded project, and a metrics-style block printed after the display tears down. It reproduces the live-display behaviour in a few seconds without running the full pipeline, which is handy when working on the progress UI and its teardown:
+
+```
+dotnet run progress-harness.cs -- --total 165 --concurrency 20 --min 60 --max 260
+```
+
+The flags (`--total`, `--concurrency`, `--min`/`--max` per-stage delay in ms) tune the workload — raise `--total` and the delays to grow the panel taller and scroll more.
