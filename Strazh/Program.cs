@@ -118,10 +118,16 @@ namespace Strazh
                 var runLogPath = Path.Combine(config.BuildLogDirectory, $"strazh-run-{timestamp}.log");
                 var metricsPath = Path.Combine(config.BuildLogDirectory, $"strazh-metrics-{timestamp}.jsonl");
                 using var fileProgress = new FileAnalysisProgress(runLogPath);
+                // SpectreConsoleProgress is listed LAST so it is the innermost WrapAsync wrapper:
+                // its live display then tears down (clearing the panel) BEFORE the outer wrappers'
+                // finally blocks run — otherwise MetricsAnalysisProgress prints its summary to the
+                // console while the live display is still active, tangling the summary with the
+                // panel and leaving stale rows behind. The console progress must still be the last
+                // to tear down, so it must be the innermost wrapper.
                 var progress = new CompositeAnalysisProgress(
-                    new SpectreConsoleProgress(),
+                    new MetricsAnalysisProgress(metricsPath),
                     fileProgress,
-                    new MetricsAnalysisProgress(metricsPath));
+                    new SpectreConsoleProgress());
                 var store = new Neo4jTripleStore(config.Credentials, config.Neo4jUrl);
                 await Analyzer.Analyze(config, progress, store);
                 Console.WriteLine("Code Knowledge Graph created.");

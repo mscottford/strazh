@@ -37,6 +37,10 @@ namespace Strazh.Analysis
         private int _total;
         private int _completed;
         private DateTime _runStart = DateTime.UtcNow;
+        // Active project rows shown at once. The panel is rendered at a constant height (this many
+        // rows plus a status line and a summary line), padded with blanks, so Spectre's live-region
+        // clear accounting stays stable — see BuildRenderable.
+        private const int MaxActiveRows = 10;
 
         private static readonly string[] SpinnerFrames =
             ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -197,6 +201,13 @@ namespace Strazh.Analysis
             }
         }
 
+        // Renders the panel at a CONSTANT height every frame: exactly MaxActiveRows active-or-blank
+        // project rows, then a status line, then the summary line. A variable height desyncs
+        // Spectre's live-region clear accounting — while the terminal scrolls, height changes leave
+        // stale rows and blank padding that AutoClear cannot reclaim on teardown. A fixed height
+        // keeps the accounting stable so AutoClear clears the whole region cleanly. The body is
+        // capped well below the viewport so completed/skipped lines stay visible in the scrollback
+        // above it.
         private IRenderable BuildRenderable()
         {
             var frame = SpinnerFrames[Math.Abs(_tick) % SpinnerFrames.Length];
@@ -208,34 +219,49 @@ namespace Strazh.Analysis
             // of dozens of identical "Waiting" lines that look frozen.
             var all = _active.Values.ToList();
             var waiting = all.Count(e => e.Stage == "Waiting");
-            // Reserve rows for completed-project lines so they remain visible above the panel.
-            var maxContentRows = Math.Max(1, AnsiConsole.Console.Profile.Height - 6);
+            // Fixed body height, but never taller than the viewport allows (leaving room above for
+            // the completed-project scrollback and this panel's own status + summary lines).
+            var panelBody = Math.Max(1, Math.Min(AnsiConsole.Console.Profile.Height - 8, MaxActiveRows));
             var active = all
                 .Where(e => e.Stage != "Waiting")
                 .OrderByDescending(e => e.LastChanged)
-                .Take(maxContentRows)
+                .Take(panelBody)
                 .ToList();
             var hiddenActive = Math.Max(0, (all.Count - waiting) - active.Count);
             var completed = Volatile.Read(ref _completed);
             var remaining = Math.Max(0, _total - completed);
 
-            var rows = new List<IRenderable>(active.Count + 3);
-            foreach (var entry in active)
+            var rows = new List<IRenderable>(panelBody + 2);
+            for (var row = 0; row < panelBody; row++)
             {
-                // Time in the current stage makes progress legible: a project that just moved to
-                // a stage shows a small, growing number rather than its whole-run elapsed.
-                var stageElapsed = now - entry.LastChanged;
-                rows.Add(new Markup(
-                    $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(stageElapsed)}[/]"));
+                if (row < active.Count)
+                {
+                    // Time in the current stage makes progress legible: a project that just moved to
+                    // a stage shows a small, growing number rather than its whole-run elapsed.
+                    var entry = active[row];
+                    var stageElapsed = now - entry.LastChanged;
+                    rows.Add(new Markup(
+                        $"[green]{frame}[/] {entry.Stage,-9} {Markup.Escape(entry.Name)}  [dim]{FormatElapsed(stageElapsed)}[/]"));
+                }
+                else
+                {
+                    rows.Add(new Markup(" ")); // blank padding row — keeps the panel height constant
+                }
             }
+
+            // Status line (always present, blank when idle): overflow-active and waiting counts.
+            var statusParts = new List<string>(2);
             if (hiddenActive > 0)
             {
-                rows.Add(new Markup($"[dim]  … {hiddenActive} more active[/]"));
+                statusParts.Add($"… {hiddenActive} more active");
             }
             if (waiting > 0)
             {
-                rows.Add(new Markup($"[dim]  {waiting} built, waiting to load[/]"));
+                statusParts.Add($"{waiting} built, waiting to load");
             }
+            rows.Add(new Markup(statusParts.Count > 0 ? $"[dim]  {string.Join(" · ", statusParts)}[/]" : " "));
+
+            // Summary line (always present).
             var pct = _total > 0 ? (int)(100.0 * completed / _total) : 0;
             rows.Add(new Markup(
                 $"[dim]{completed}/{_total} done ({pct}%) · {remaining} remaining · {FormatElapsed(now - _runStart)} elapsed[/]"));
