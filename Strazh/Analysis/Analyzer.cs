@@ -212,12 +212,19 @@ namespace Strazh.Analysis
                 {
                     Console.WriteLine($"Recording solution \"{solutionName}\" as not analyzed: {ex.Message}");
                     var solutionRoot = GetRoot(solutionPath);
-                    await store.InsertAsync(new List<Triple>
+                    // Buildalyzer failed to parse the solution, but git resolution is independent, so
+                    // the Solution/Folder are still versioned by (and linked to) the repo's HEAD commit.
+                    var solutionCommit = GitHelper.GetCommitNode(solutionPath);
+                    var solutionSha = solutionCommit?.Sha;
+                    var solutionNode = new SolutionNode(solutionName, buildFailed: true, commitSha: solutionSha);
+                    var solutionRootNode = new FolderNode(solutionRoot, solutionRoot, solutionSha);
+                    var fallbackTriples = new List<Triple>
                     {
-                        new TripleIncludedIn(
-                            new SolutionNode(solutionName, buildFailed: true),
-                            new FolderNode(solutionRoot, solutionRoot)),
-                    });
+                        new TripleIncludedIn(solutionNode, solutionRootNode),
+                    };
+                    AddFromCommit(fallbackTriples, solutionNode, solutionCommit);
+                    AddFromCommit(fallbackTriples, solutionRootNode, solutionCommit);
+                    await store.InsertAsync(fallbackTriples);
                     continue;
                 }
 
@@ -1061,12 +1068,20 @@ namespace Strazh.Analysis
         {
             var triples = new List<Triple>();
 
+            // The solution and every folder are versioned by the HEAD commit of the repo that
+            // physically contains them, so the same solution/folder checked out at two commits
+            // becomes two distinct nodes (matching how projects, files, and code are versioned).
+            var solutionCommit = GitHelper.GetCommitNode(solutionFilePath);
+            var solutionSha = solutionCommit?.Sha;
+
             var solutionRoot = GetRoot(solutionFilePath);
-            var solutionRootNode = new FolderNode(solutionRoot, solutionRoot);
+            var solutionRootNode = new FolderNode(solutionRoot, solutionRoot, solutionSha);
 
             var solutionName = GetSolutionName(solutionFilePath);
-            var solutionNode = new SolutionNode(solutionName);
+            var solutionNode = new SolutionNode(solutionName, commitSha: solutionSha);
             triples.Add(new TripleIncludedIn(solutionNode, solutionRootNode));
+            AddFromCommit(triples, solutionNode, solutionCommit);
+            AddFromCommit(triples, solutionRootNode, solutionCommit);
 
             // Host repository root folder. Naming uses the natural repo name from origin
             // (last segment of "owner/repo") rather than the local clone's directory
@@ -1074,7 +1089,7 @@ namespace Strazh.Analysis
             var solutionRepoName = GitHelper.GetRepositoryName(solutionFilePath);
             var solutionGitRoot = GitHelper.FindGitRoot(solutionFilePath);
             var solutionRepoFolder = solutionRepoName != null
-                ? AttachRepoRoot(triples, solutionRepoName)
+                ? AttachRepoRoot(triples, solutionRepoName, solutionCommit)
                 : null;
 
             // Submodule mount points declared in the host repo's .gitmodules: a
@@ -1085,18 +1100,38 @@ namespace Strazh.Analysis
                 foreach (var sub in GitHelper.GetSubmodules(solutionFilePath))
                 {
                     var mountPath = sub.MountPath.Replace('\\', '/');
+
+                    // The mount point is a gitlink in the HOST tree, so the folder itself belongs to
+                    // the host's commit: INCLUDED_IN the host folder tree and FROM the host
+                    // commit (which HAS-attributes it to the host repository).
                     var mountFolder = new FolderNode(
                         $"{solutionRepoFolder.Name}/{mountPath}",
                         Path.GetFileName(mountPath),
-                        FolderKind.Submodule);
+                        FolderKind.Submodule,
+                        solutionSha);
                     triples.Add(new TripleIncludedIn(mountFolder, solutionRepoFolder));
-                    triples.Add(new TripleIncludedIn(mountFolder, new RepositoryNode(sub.RepositoryName)));
+                    AddFromCommit(triples, mountFolder, solutionCommit);
+
+                    // The mount directory's HEAD is the submodule's pinned (detached) commit. The
+                    // folder PINS it, and HAS attributes that commit to the submodule's own
+                    // repository — so the submodule repo is discovered via the pinned commit rather
+                    // than a direct folder→repository edge.
+                    var pinnedCommit = solutionGitRoot != null
+                        ? GitHelper.GetCommitNode(Path.Combine(solutionGitRoot, sub.MountPath))
+                        : null;
+                    if (pinnedCommit != null)
+                    {
+                        triples.Add(new TriplePins(mountFolder, pinnedCommit));
+                        AddRepositoryOwns(triples, pinnedCommit);
+                    }
                 }
             }
 
             // The project's own git root determines its repository. For a project living
             // inside a submodule, this is the submodule's git root — not the solution's.
             var projectPath = projectFilePath;
+            var projectCommit = projectPath != null ? GitHelper.GetCommitNode(projectPath) : null;
+            var projectSha = projectCommit?.Sha;
             var projectGitRoot = projectPath != null ? GitHelper.FindGitRoot(projectPath) : null;
             var projectRepoName = projectPath != null ? GitHelper.GetRepositoryName(projectPath) : null;
             var projectIsInSubmodule = projectGitRoot != null
@@ -1106,35 +1141,65 @@ namespace Strazh.Analysis
             var projectRoot = projectPath != null ? GetRoot(projectPath) : null;
             if (!string.IsNullOrEmpty(projectRoot))
             {
-                var projectRootNode = new FolderNode(projectRoot, projectRoot);
+                var projectRootNode = new FolderNode(projectRoot, projectRoot, projectSha);
                 // Submodule project → attach to its own repo's root folder. Host project →
                 // attach to the solution root (existing behavior). If we can't identify
                 // the submodule's repo, leave the folder un-attached rather than misattributing.
                 var parentFolder = projectIsInSubmodule
-                    ? (projectRepoName != null ? AttachRepoRoot(triples, projectRepoName) : null)
+                    ? (projectRepoName != null ? AttachRepoRoot(triples, projectRepoName, projectCommit) : null)
                     : solutionRootNode;
                 if (parentFolder != null
                     && !projectRoot.Equals(parentFolder.Name, StringComparison.OrdinalIgnoreCase))
                 {
                     triples.Add(new TripleIncludedIn(projectRootNode, parentFolder));
+                    AddFromCommit(triples, projectRootNode, projectCommit);
                 }
             }
 
-            var projectNode = new ProjectNode(projectName);
+            // Version the CONTAINS target by the project's commit so it MERGEs onto the same node
+            // BuildProjectTriples produces (which also carries the target frameworks and FROM).
+            var projectNode = new ProjectNode(projectName, projectName, commitSha: projectSha);
             triples.Add(new TripleContains(solutionNode, projectNode));
 
             return triples;
         }
 
-        // Emits Folder(<natural-repo-name>) -INCLUDED_IN-> Repository(<owner/repo>) and
-        // returns the folder. The folder name comes from the last segment of the repo
-        // name, so PKs are stable regardless of local clone directory naming.
-        private static FolderNode AttachRepoRoot(List<Triple> triples, string repoName)
+        // Creates the repo-root folder (named by the repo's short name so its pk is stable
+        // regardless of the local clone directory) versioned by, and linked via FROM to,
+        // the repo's HEAD commit when one could be resolved. No direct folder→repository edge is
+        // emitted: the folder's repository is discovered through its commit (Repository-[:HAS]->Commit,
+        // recorded by AddFromCommit).
+        private static FolderNode AttachRepoRoot(List<Triple> triples, string repoName, CommitNode? commit)
         {
             var folderName = Path.GetFileName(repoName);
-            var folder = new FolderNode(folderName, folderName);
-            triples.Add(new TripleIncludedIn(folder, new RepositoryNode(repoName)));
+            var folder = new FolderNode(folderName, folderName, commit?.Sha);
+            AddFromCommit(triples, folder, commit);
             return folder;
+        }
+
+        // Links a versioned node to the commit it was seen in and records that commit under its
+        // repository, so the node's repository is reachable transitively (node -FROM-> Commit
+        // <-HAS- Repository). A path outside a readable git repo yields a null commit and the node
+        // stays unversioned with no edges.
+        private static void AddFromCommit(List<Triple> triples, Node node, CommitNode? commit)
+        {
+            if (commit == null)
+            {
+                return;
+            }
+            triples.Add(new TripleFrom(node, commit));
+            AddRepositoryOwns(triples, commit);
+        }
+
+        // Records Repository-[:HAS]->Commit. Commits with no resolvable origin (a repo with no
+        // remote) carry an empty repo name and get no HAS edge, rather than a dangling empty-named
+        // Repository node.
+        private static void AddRepositoryOwns(List<Triple> triples, CommitNode commit)
+        {
+            if (!string.IsNullOrEmpty(commit.Repo))
+            {
+                triples.Add(new TripleHas(new RepositoryNode(commit.Repo), commit));
+            }
         }
 
         private static async Task<IList<Triple>> AnalyzeProject((Project project, IAnalyzerResult projectAnalyzerResult) item, Tiers mode)
@@ -1180,7 +1245,13 @@ namespace Strazh.Analysis
             var path = result.ProjectFilePath;
             var projectName = GetProjectName(path);
             var root = GetRoot(path);
-            var rootNode = new FolderNode(root, root);
+
+            // The project (and its root folder) is versioned by its own git root's HEAD, so copies
+            // of the same project at different commits become distinct nodes. FROM is emitted
+            // here (the guaranteed per-project path) so it fires exactly once per represented project.
+            var projectCommit = GitHelper.GetCommitNode(path);
+            var projectSha = projectCommit?.Sha;
+            var rootNode = new FolderNode(root, root, projectSha);
 
             var analyzer = result.Analyzer ?? result.Manager?.GetProject(IOPath.Parse(path));
             var targetFrameworks = analyzer?.ProjectFile?.TargetFrameworks ?? Array.Empty<string>();
@@ -1193,12 +1264,17 @@ namespace Strazh.Analysis
             // (RealTfmResults forwards only succeeded builds), and marking it here would mismark a
             // multi-target project when one TFM fails but another succeeds. buildFailed is decided
             // per project by the fallback sweep, which runs only when no build succeeded at all.
-            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks);
+            var projectNode = new ProjectNode(projectName, projectName, targetFrameworks, commitSha: projectSha);
             triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            AddFromCommit(triples, projectNode, projectCommit);
+            AddFromCommit(triples, rootNode, projectCommit);
             result.ProjectReferences.ToList().ForEach(x =>
             {
                 var refName = GetProjectName(x);
-                triples.Add(new TripleDependsOnProject(projectNode, new ProjectNode(refName, refName, null, File.Exists(x))));
+                // Version the reference target by the referenced project's own commit, so it MERGEs
+                // onto the same node that project produces when it is itself analyzed.
+                var refSha = GitHelper.GetCommit(x)?.Sha;
+                triples.Add(new TripleDependsOnProject(projectNode, new ProjectNode(refName, refName, null, File.Exists(x), commitSha: refSha)));
             });
             result.PackageReferences.ToList().ForEach(x =>
             {
@@ -1218,10 +1294,13 @@ namespace Strazh.Analysis
             var triples = new List<Triple>();
             var projectName = GetProjectName(projectFile.Path);
             var root = GetRoot(projectFile.Path);
-            var rootNode = new FolderNode(root, root);
 
-            var projectNode = new ProjectNode(projectName, projectName, projectFile.TargetFrameworks, exists: true, buildFailed: true);
+            var projectCommit = GitHelper.GetCommitNode(projectFile.Path);
+            var rootNode = new FolderNode(root, root, projectCommit?.Sha);
+            var projectNode = new ProjectNode(projectName, projectName, projectFile.TargetFrameworks, exists: true, buildFailed: true, commitSha: projectCommit?.Sha);
             triples.Add(new TripleIncludedIn(projectNode, rootNode));
+            AddFromCommit(triples, projectNode, projectCommit);
+            AddFromCommit(triples, rootNode, projectCommit);
             foreach (var package in projectFile.PackageReferences)
             {
                 var version = string.IsNullOrEmpty(package.Version) ? "none" : package.Version;

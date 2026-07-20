@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using Microsoft.CodeAnalysis;
@@ -117,5 +118,116 @@ public class ExtractorTests
             t is TripleIncludedIn
             && t.NodeA is FileNode { Name: "Widget.cs" }
             && t.NodeB is FolderNode { Name: "src" });
+    }
+
+    [Fact]
+    public void AnalyzeTree_StampsDeclaredNodesWithTheirFileCommit()
+    {
+        using var repo = new TempGitRepo();
+        var srcDir = Path.Combine(repo.Root, "src");
+        Directory.CreateDirectory(srcDir);
+        var filePath = Path.Combine(srcDir, "Widget.cs");
+        File.WriteAllText(filePath, Source);
+
+        var triples = AnalyzeClasses(filePath);
+
+        // The declared class, its declared method, and the file all carry the repo's HEAD commit.
+        var widget = triples.Select(t => t.NodeA).OfType<ClassNode>().First(c => c.Name == "Widget");
+        Assert.Equal(repo.Head, widget.CommitSha);
+
+        var compute = triples.Select(t => t.NodeB).OfType<MethodNode>().First(m => m.Name == "Compute");
+        Assert.Equal(repo.Head, compute.CommitSha);
+
+        var file = triples.Select(t => t.NodeB).OfType<FileNode>().First(f => f.Name == "Widget.cs");
+        Assert.Equal(repo.Head, file.CommitSha);
+
+        // The folders on the file's chain are versioned by the same commit as the file.
+        var srcFolder = triples.Select(t => t.NodeB).OfType<FolderNode>().First(f => f.Name == "src");
+        Assert.Equal(repo.Head, srcFolder.CommitSha);
+
+        // FROM links the declared class to a Commit node carrying that sha.
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "FROM"
+            && t.NodeA is ClassNode { Name: "Widget" }
+            && t.NodeB is CommitNode commit && commit.Sha == repo.Head);
+
+        // ...and each folder on the chain is linked to that commit too.
+        Assert.Contains(triples, t =>
+            t.Relationship.Type == "FROM"
+            && t.NodeA is FolderNode { Name: "src" }
+            && t.NodeB is CommitNode commit && commit.Sha == repo.Head);
+    }
+
+    [Fact]
+    public void AnalyzeTree_OutsideGitRepository_LeavesNodesUnversioned()
+    {
+        // The default synthetic path is not under a git repo, so nodes degrade to unversioned
+        // (null commitSha) and no FROM is emitted — the graph still builds.
+        var triples = AnalyzeClasses();
+
+        var widget = triples.Select(t => t.NodeA).OfType<ClassNode>().First(c => c.Name == "Widget");
+        Assert.Null(widget.CommitSha);
+        Assert.DoesNotContain(triples, t => t.Relationship.Type == "FROM");
+    }
+
+    // A throwaway git repository with a single seed commit, for exercising the file-path -> commit
+    // resolution end to end. git init (no remote), so the commit has a sha but no origin repo name.
+    private sealed class TempGitRepo : IDisposable
+    {
+        public string Root { get; }
+        public string Head { get; }
+
+        public TempGitRepo()
+        {
+            Root = Path.Combine(Path.GetTempPath(), $"strazh-extractor-git-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(Root);
+            Run("init", "--initial-branch=main");
+            Run("config", "user.email", "test@strazh.invalid");
+            Run("config", "user.name", "Strazh Test");
+            File.WriteAllText(Path.Combine(Root, "seed.txt"), "seed");
+            Run("add", "seed.txt");
+            Run("commit", "-m", "seed");
+            Head = Exec(capture: true, "rev-parse", "HEAD");
+        }
+
+        private void Run(params string[] args) => Exec(capture: false, args);
+
+        private string Exec(bool capture, params string[] args)
+        {
+            var psi = new ProcessStartInfo("git")
+            {
+                WorkingDirectory = Root,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in args)
+            {
+                psi.ArgumentList.Add(a);
+            }
+            using var p = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start git");
+            var stdout = p.StandardOutput.ReadToEnd();
+            var stderr = p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            if (p.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"git {string.Join(" ", args)} failed (exit={p.ExitCode})\nstderr: {stderr}");
+            }
+            return capture ? stdout.Trim() : stdout;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
     }
 }

@@ -136,15 +136,16 @@ public class AnalyzerTests
     }
 
     /// <summary>
-    /// Verifies that analyzing a solution creates a Repository node and the
-    /// Folder(repoShortName) -INCLUDED_IN-> Repository(owner/repo) triple.
+    /// Verifies that analyzing a solution creates a Repository node that owns the repo's HEAD
+    /// commit via Repository(owner/repo) -HAS-> Commit, which is how a node's repository is
+    /// discovered now (transitively through its commit) rather than by a direct folder edge.
     ///
     /// The expected repository name is read from the git remote "origin" of the
     /// containing repository, so the test passes unchanged on both the upstream
     /// repo (vladbatushkov/strazh) and any fork (e.g. mscottford/strazh).
     /// </summary>
     [Fact]
-    public async Task Analyze_CreatesRepositoryNodeAndFolderIncludedInTriple()
+    public async Task Analyze_CreatesRepositoryNodeOwningItsHeadCommit()
     {
         var solutionPath = Path.Combine(GetRepoRoot(), "SystemUnderTest", "SystemUnderTest.sln");
         var config = new AnalyzerConfig(new AnalyzerConfig.Options(
@@ -163,14 +164,22 @@ public class AnalyzerTests
         var expectedRepoName = GitHelper.GetRepositoryName(solutionPath);
         Assert.NotNull(expectedRepoName);
 
-        var expectedFolderName = expectedRepoName.Split('/').Last();
+        // Repository -HAS-> Commit, and there is no direct Folder -INCLUDED_IN-> Repository edge.
+        var hasTriple = triples.FirstOrDefault(t =>
+            t.NodeA is RepositoryNode repo && repo.FullName == expectedRepoName &&
+            t.NodeB is CommitNode &&
+            t.Relationship.Type == "HAS");
+        Assert.NotNull(hasTriple);
 
-        var repoTriple = triples.FirstOrDefault(t =>
-            t.NodeA is FolderNode folder && folder.Name == expectedFolderName &&
-            t.NodeB is RepositoryNode repo && repo.FullName == expectedRepoName &&
-            t.Relationship.Type == "INCLUDED_IN");
+        Assert.DoesNotContain(triples, t =>
+            t.NodeB is RepositoryNode && t.Relationship.Type == "INCLUDED_IN");
 
-        Assert.NotNull(repoTriple);
+        // The owned commit is reachable from a folder via FROM, completing the discovery path
+        // folder -FROM-> Commit <-HAS- Repository.
+        var ownedCommit = (CommitNode)hasTriple.NodeB;
+        Assert.Contains(triples, t =>
+            t.NodeA is FolderNode && t.Relationship.Type == "FROM" &&
+            t.NodeB is CommitNode commit && commit.Sha == ownedCommit.Sha);
     }
 
     /// <summary>

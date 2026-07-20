@@ -93,6 +93,7 @@ public class Neo4jWritePathIntegrationTests(Neo4jContainerFixture fixture) : ICl
         var package = new PackageNode($"{prefix}Newtonsoft.Json", $"{prefix}Newtonsoft.Json", "13.0.1");
         var submodule = new FolderNode($"{prefix}Core", $"{prefix}Core", FolderKind.Submodule);
         var repository = new RepositoryNode($"{prefix}my-repo");
+        var commit = new CommitNode($"{prefix}sha", $"{prefix}my-repo", "d1", "d2", "Author", "subject");
         var klass = new ClassNode($"{prefix}Ns.Foo", "Foo", new[] { "public", "sealed" });
         var file = new FileNode($"{prefix}Foo.cs", "Foo.cs");
 
@@ -100,7 +101,8 @@ public class Neo4jWritePathIntegrationTests(Neo4jContainerFixture fixture) : ICl
         {
             new TripleContains(sln, projWithTfms),
             new TripleDependsOnPackage(projWithTfms, package),
-            new TripleIncludedIn(submodule, repository),
+            new TriplePins(submodule, commit),   // submodule mount -> pinned commit
+            new TripleHas(repository, commit),    // repository -> commit it owns
             new TripleDeclaredAt(klass, file),
             new TripleContains(sln, projReference), // don't-clobber probe, merged last
         };
@@ -128,7 +130,7 @@ public class Neo4jWritePathIntegrationTests(Neo4jContainerFixture fixture) : ICl
         Assert.Equal("13.0.1", version.As<string>());
 
         var kind = await ScalarAsync(session,
-            $"MATCH (f:Folder {{fullName:'{prefix}Core'}})-[:INCLUDED_IN]->(:Repository) RETURN f.kind AS v");
+            $"MATCH (f:Folder {{fullName:'{prefix}Core'}})-[:PINS]->(c:Commit)<-[:HAS]-(:Repository) RETURN f.kind AS v");
         Assert.Equal("Submodule", kind.As<string>());
 
         var modifiers = await ScalarAsync(session,

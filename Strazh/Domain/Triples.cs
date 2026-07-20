@@ -52,12 +52,6 @@ namespace Strazh.Domain
             : base(contentA, contentB, new IncludedInRelationship())
         { }
 
-        public TripleIncludedIn(
-            FolderNode folder,
-            RepositoryNode repository)
-            : base(folder, repository, new IncludedInRelationship())
-        { }
-
     }
     
     public class TripleContains(
@@ -96,4 +90,23 @@ namespace Strazh.Domain
             : base(interfaceA, interfaceB, new OfTypeRelationship())
         { }
     }
+
+    // Version provenance
+
+    // A versioned node (Project / File / Class / Interface / Method / Folder / Solution) and the
+    // commit it came from.
+    public class TripleFrom(
+        Node node,
+        CommitNode commit) : Triple(node, commit, new FromRelationship());
+
+    // A repository and a commit that belongs to it. Emitted for every commit the analysis records,
+    // so a node's repository is reachable via (node)-[:FROM]->(:Commit)<-[:HAS]-(:Repository).
+    public class TripleHas(
+        RepositoryNode repository,
+        CommitNode commit) : Triple(repository, commit, new HasRelationship());
+
+    // A submodule mount-point folder and the submodule's checked-out (pinned) commit.
+    public class TriplePins(
+        FolderNode folder,
+        CommitNode commit) : Triple(folder, commit, new PinsRelationship());
 }

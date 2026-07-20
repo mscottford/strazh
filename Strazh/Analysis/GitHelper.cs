@@ -1,6 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using Strazh.Domain;
 
 namespace Strazh.Analysis
 {
@@ -11,8 +15,167 @@ namespace Strazh.Analysis
     /// </summary>
     public sealed record Submodule(string MountPath, string RepositoryName);
 
+    /// <summary>
+    /// The HEAD commit of a checked-out git repository (or submodule): the commit sha plus the
+    /// metadata used to identify and date that version in the graph. Dates are ISO-8601 strict
+    /// (<c>%aI</c>/<c>%cI</c>) so they sort lexicographically.
+    /// </summary>
+    public sealed record CommitInfo(
+        string Sha,
+        string AuthoredDate,
+        string CommittedDate,
+        string Author,
+        string AuthorEmail,
+        string Subject);
+
     public static class GitHelper
     {
+        // The HEAD commit is the same for every path inside one working tree, so memoize by git
+        // root. The cache is keyed on the resolved root path (not the caller's path) and holds
+        // failures (null) too, so a non-repo or unreadable root is probed at most once. Concurrent
+        // because analysis resolves shas from parallel per-project tasks.
+        private static readonly ConcurrentDictionary<string, CommitInfo?> CommitCache = new();
+
+        // Resolving a symbol's commit runs per source reference (potentially millions of times), and
+        // each call would otherwise walk the directory tree looking for .git. Memoize the walk by
+        // directory so repeated lookups within a tree are dictionary hits.
+        private static readonly ConcurrentDictionary<string, string?> GitRootCache = new();
+
+        // Origin repo name is stable per git root and read from config on disk; cache it since it is
+        // now looked up per declared file / per project when building Commit nodes.
+        private static readonly ConcurrentDictionary<string, string?> RepoNameCache = new();
+
+        /// <summary>
+        /// The <see cref="CommitNode"/> for the git repository nearest to <paramref name="startPath"/>
+        /// — its HEAD commit (sha + dates + author + subject) tagged with the origin <c>owner/repo</c>.
+        /// Returns <c>null</c> when the path is not inside a readable git repository.
+        /// </summary>
+        public static CommitNode? GetCommitNode(string startPath)
+        {
+            var commit = GetCommit(startPath);
+            if (commit == null)
+            {
+                return null;
+            }
+            return new CommitNode(
+                commit.Sha,
+                GetRepositoryName(startPath) ?? "",
+                commit.AuthoredDate,
+                commit.CommittedDate,
+                commit.Author,
+                commit.Subject);
+        }
+
+        /// <summary>
+        /// The HEAD commit of the git repository nearest to <paramref name="startPath"/>. For a
+        /// submodule checkout this is the pinned commit (its detached HEAD); for a regular clone it
+        /// is the branch tip. Returns <c>null</c> when the path is not inside a git repository or the
+        /// commit cannot be read. Memoized per git root.
+        /// </summary>
+        public static CommitInfo? GetCommit(string startPath)
+        {
+            var gitRoot = FindGitRootCached(startPath);
+            if (gitRoot == null)
+            {
+                return null;
+            }
+            return CommitCache.GetOrAdd(gitRoot, ReadHeadCommit);
+        }
+
+        // FindGitRoot memoized by the starting directory (its result — the resolved root — is already
+        // an absolute path, so it doubles as the CommitCache key).
+        private static string? FindGitRootCached(string startPath)
+        {
+            var dir = Directory.Exists(startPath) ? startPath : Path.GetDirectoryName(startPath);
+            if (dir == null)
+            {
+                return FindGitRoot(startPath);
+            }
+            return GitRootCache.GetOrAdd(Path.GetFullPath(dir), resolvedDir =>
+            {
+                var root = FindGitRoot(resolvedDir);
+                return root == null ? null : Path.GetFullPath(root);
+            });
+        }
+
+        // Field indices into the NUL-separated `git show` output. They must match the order of the
+        // placeholders in CommitFormat below (%H %aI %cI %an %ae %s); ExpectedFieldCount guards that
+        // every field is present before any is read.
+        private const int ShaField = 0;
+        private const int AuthoredDateField = 1;
+        private const int CommittedDateField = 2;
+        private const int AuthorField = 3;
+        private const int AuthorEmailField = 4;
+        private const int SubjectField = 5;
+        private const int ExpectedFieldCount = 6;
+
+        // NUL-separated (%x00) so an author name or subject line can never be mistaken for a field
+        // boundary; the subject (%s) is a single line and comes last.
+        private const string CommitFormat = "--format=%H%x00%aI%x00%cI%x00%an%x00%ae%x00%s";
+
+        // Reads HEAD's commit metadata via a single `git show`. Shelling out lets git resolve HEAD
+        // through loose refs, packed-refs, and detached submodule heads uniformly — no plumbing-file
+        // parsing here.
+        private static CommitInfo? ReadHeadCommit(string gitRoot)
+        {
+            var output = RunGit(gitRoot, "show", "-s", "--no-patch", CommitFormat, "HEAD");
+            if (output == null)
+            {
+                return null;
+            }
+            var parts = output.Split('\0');
+            if (parts.Length < ExpectedFieldCount)
+            {
+                return null;
+            }
+            var sha = parts[ShaField].Trim();
+            return sha.Length == 0
+                ? null
+                : new CommitInfo(
+                    Sha: sha,
+                    AuthoredDate: parts[AuthoredDateField].Trim(),
+                    CommittedDate: parts[CommittedDateField].Trim(),
+                    Author: parts[AuthorField],
+                    AuthorEmail: parts[AuthorEmailField],
+                    Subject: parts[SubjectField].Trim());
+        }
+
+        // Runs `git` in <paramref name="workingDir"/> and returns stdout on success, or null on a
+        // non-zero exit or if git is unavailable. stderr is drained (and discarded) so the child
+        // never blocks on a full pipe; a missing/failed git is a soft failure — the caller degrades
+        // to an unversioned node rather than aborting the analysis.
+        private static string? RunGit(string workingDir, params string[] args)
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo("git")
+                {
+                    WorkingDirectory = workingDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                foreach (var arg in args)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+                using var process = Process.Start(startInfo);
+                if (process == null)
+                {
+                    return null;
+                }
+                var stdout = process.StandardOutput.ReadToEnd();
+                process.StandardError.ReadToEnd();
+                process.WaitForExit();
+                return process.ExitCode == 0 ? stdout : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         /// <summary>
         /// Walks up from <paramref name="startPath"/> until a directory containing a
         /// <c>.git</c> entry (a directory for a regular repo, a file for a submodule
@@ -42,13 +205,16 @@ namespace Strazh.Analysis
         /// </summary>
         public static string? GetRepositoryName(string startPath)
         {
-            var gitRoot = FindGitRoot(startPath);
+            var gitRoot = FindGitRootCached(startPath);
             if (gitRoot == null)
             {
                 return null;
             }
-            var url = ReadOriginUrl(gitRoot);
-            return url == null ? null : ParseRepoName(url);
+            return RepoNameCache.GetOrAdd(gitRoot, root =>
+            {
+                var url = ReadOriginUrl(root);
+                return url == null ? null : ParseRepoName(url);
+            });
         }
 
         /// <summary>
