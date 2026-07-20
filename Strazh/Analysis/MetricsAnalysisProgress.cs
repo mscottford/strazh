@@ -78,6 +78,9 @@ namespace Strazh.Analysis
         public void OnProjectDeferred(string projectFilePath, string filename, string reason)
             => Record(projectFilePath, filename, "deferred");
 
+        // Informational only; not a timing stage, so it does not affect the metrics timeline.
+        public void OnProjectWarning(string projectFilePath, string filename, string reason) { }
+
         public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
             => Finish(projectFilePath, filename, buildFailed ? "recorded (build failed)" : "recorded", tripleCount, "Recorded");
 

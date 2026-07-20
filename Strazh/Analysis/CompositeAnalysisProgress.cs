@@ -83,6 +83,14 @@ namespace Strazh.Analysis
             }
         }
 
+        public void OnProjectWarning(string projectFilePath, string filename, string reason)
+        {
+            foreach (var impl in _implementations)
+            {
+                impl.OnProjectWarning(projectFilePath, filename, reason);
+            }
+        }
+
         public void OnProjectRecordedFromFallback(string projectFilePath, string filename, int tripleCount, bool buildFailed)
         {
             foreach (var impl in _implementations)
