@@ -687,6 +687,7 @@ namespace Strazh.Analysis
         private static async Task<IReadOnlyList<IAnalyzerResult>?> RunFreshBuildLoopAsync(
             ProjectBuildState state, BuildStageContext stage)
         {
+            string? lastBuildError = null;
             for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
             {
                 stage.Callbacks.OnBuildStarted?.Invoke(state.Identity.Path, state.Identity.Name, false, stage.BuildLabel);
@@ -695,6 +696,10 @@ namespace Strazh.Analysis
                 {
                     SignalBuildNotCompleted(state.Identity, reason: "build timed out", stage);
                     return null;
+                }
+                if (outcome.BuildError != null)
+                {
+                    lastBuildError = outcome.BuildError;
                 }
                 // Read from the binlog rather than the pipe result. The pipe uses
                 // MsBuildPipeLogger, which may not support the event types emitted by
@@ -724,7 +729,11 @@ namespace Strazh.Analysis
                 }
                 else
                 {
-                    var reason = binlogExists ? "build log could not be read" : "build failed";
+                    var reason = binlogExists
+                        ? "build log could not be read"
+                        : lastBuildError != null
+                            ? $"build failed: {SummarizeBuildError(lastBuildError)}"
+                            : "build failed";
                     SignalBuildNotCompleted(state.Identity, reason, stage);
                     return null;
                 }
@@ -751,7 +760,10 @@ namespace Strazh.Analysis
                 }
                 if (attempt == MaxBuildAttempts)
                 {
-                    SignalBuildNotCompleted(identity, reason: "build failed", stage);
+                    var reason = outcome.BuildError != null
+                        ? $"build failed: {SummarizeBuildError(outcome.BuildError)}"
+                        : "build failed";
+                    SignalBuildNotCompleted(identity, reason, stage);
                     return null;
                 }
             }
@@ -768,6 +780,14 @@ namespace Strazh.Analysis
             {
                 stage.Callbacks.OnProjectDeferred?.Invoke(identity.Path, identity.FileName, reason);
             }
+        }
+
+        // Reduces a build exception message to a single trimmed line, capped in length, so a deferred
+        // project's reason stays readable in the progress output and logs.
+        private static string SummarizeBuildError(string message)
+        {
+            var firstLine = message.Split('\n', 2)[0].Trim();
+            return firstLine.Length > 120 ? firstLine[..120] + "…" : firstLine;
         }
 
         // If a build hangs (e.g. Android/MAUI projects waiting on SDK tools not present in the
@@ -838,20 +858,35 @@ namespace Strazh.Analysis
             return [];
         }
 
-        private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut);
+        private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut, string? BuildError = null);
 
         private static async Task<BuildOutcome> BuildWithTimeoutAsync(IProjectAnalyzer project, EnvironmentOptions opts)
         {
+            string? buildError = null;
             var buildTask = Task.Run<IReadOnlyList<IAnalyzerResult>?>(() =>
             {
-                var results = RealTfmResults(project.Build(opts));
-                return results.Count > 0 ? results : null;
+                try
+                {
+                    var results = RealTfmResults(project.Build(opts));
+                    return results.Count > 0 ? results : null;
+                }
+                catch (Exception exception)
+                {
+                    // Buildalyzer throws for a project it cannot build at all — e.g. "Could not find
+                    // build environment" when the SDK/workload for that project type (Xamarin/MAUI or
+                    // an older toolset) is not installed. Record the message and return no results so
+                    // the project is retried and then deferred like any other build failure, instead
+                    // of the exception propagating and aborting the whole analysis run.
+                    buildError = exception.Message;
+                    return null;
+                }
             });
             if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
             {
                 return new BuildOutcome(Results: null, TimedOut: true);
             }
-            return new BuildOutcome(await buildTask.ConfigureAwait(false), TimedOut: false);
+            // buildTask has completed, so the catch block's write to buildError is visible here.
+            return new BuildOutcome(await buildTask.ConfigureAwait(false), TimedOut: false, BuildError: buildError);
         }
 
         // Filters out entries that don't correspond to a real target-framework build.
