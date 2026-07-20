@@ -9,6 +9,32 @@ Your codebase - is your Knowledge Graph.
 
 More details in the article [Codebase Knowledge Graph](https://vladbatushkov.medium.com/204f32b58813?source=friends_link&sk=adc2d577a5fa3ae9886b2dd6eb29b428)
 
+## About this fork
+
+This is a fork of [vladbatushkov/strazh](https://github.com/vladbatushkov/strazh) with significant reliability, data, performance, and usability improvements made while using Strazh to analyze a large set of real-world .NET solutions. Highlights:
+
+**Robustness — the analysis no longer aborts on a single bad project or solution:**
+- Projects the build pipeline drops (build failed, unreadable log, or timed out) are represented from fallback data instead of silently vanishing from the graph.
+- Unparseable solutions are recorded as build-failed rather than aborting the whole run.
+- Unresolvable project references are recovered from instead of being fatal.
+- Truncated binlogs are re-read with a short delay, and Buildalyzer's `Could not find build environment` (a missing SDK/workload, e.g. Xamarin/MAUI) is treated as a build failure — neither crashes the run.
+
+**Richer graph data:**
+- Project target frameworks are recorded on `Project` nodes.
+- Submodule references are detected, so submodule folders are no longer misattributed to the parent repository.
+
+**Performance:**
+- Neo4j inserts are batched and parameterized.
+
+**Usability:**
+- A directory scan mode analyzes every solution and project beneath a directory in a single build/load pass, instead of requiring separate per-solution and project-sweep runs.
+
+**Progress & diagnostics:**
+- The console progress uses `AnsiConsole.Progress` (fixing terminal-state corruption), shows a compact live panel with per-stage timing, and tears down cleanly at the end of a run.
+- Per-stage analysis metrics are written to a report file at the end of each run.
+- A `progress-harness.cs` tool (see [Development](#development)) exercises the progress display in isolation.
+- All build warnings fixed; git detection is worktree-aware.
+
 #### Documentation
 
 [Run with docker-compose](/Documentation/docker-compose-run.md)
