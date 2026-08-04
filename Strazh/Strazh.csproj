@@ -20,4 +20,10 @@
     <PackageReference Include="System.CommandLine" Version="2.0.6" />
   </ItemGroup>
 
+  <!-- The binlog staging helpers are internal to the analyzer but are exercised directly by the
+       tests, since driving them through a real MSBuild build would not be a unit test. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Strazh.Tests" />
+  </ItemGroup>
+
 </Project>
