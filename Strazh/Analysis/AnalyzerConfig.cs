@@ -44,8 +44,17 @@ namespace Strazh.Analysis
             string? CacheDirectory = null,
             bool NoCache = false,
             string? BuildLogDirectory = null,
-            string? Neo4jUrl = null
+            string? Neo4jUrl = null,
+            int? BuildTimeoutMinutes = null
         );
+
+        /// <summary>
+        /// How long a single MSBuild invocation may run before the project is abandoned. Large
+        /// applications and test assemblies routinely take several minutes to build from cold, and a
+        /// project that times out is dropped from the graph with only its project node left, so the
+        /// default is set well above a normal build rather than close to it.
+        /// </summary>
+        public static readonly TimeSpan DefaultBuildTimeout = TimeSpan.FromMinutes(20);
 
         public CredentialsConfig Credentials { get; }
         public Tiers Tier { get; }
@@ -57,6 +66,7 @@ namespace Strazh.Analysis
         public bool NoCache { get; }
         public string BuildLogDirectory { get; }
         public string Neo4jUrl { get; }
+        public TimeSpan BuildTimeout { get; }
 
         public bool IsSolutionBased => !string.IsNullOrEmpty(Solution);
 
@@ -101,6 +111,11 @@ namespace Strazh.Analysis
                 : options.BuildLogDirectory;
             NoCache = options.NoCache;
             Neo4jUrl = string.IsNullOrEmpty(options.Neo4jUrl) ? "neo4j://localhost:7687" : options.Neo4jUrl;
+            // A zero or negative timeout would abandon every build immediately, so it is read as
+            // "not specified" rather than taken literally.
+            BuildTimeout = options.BuildTimeoutMinutes is > 0
+                ? TimeSpan.FromMinutes(options.BuildTimeoutMinutes.Value)
+                : DefaultBuildTimeout;
         }
 
         private Tiers MapTier(string? mode)

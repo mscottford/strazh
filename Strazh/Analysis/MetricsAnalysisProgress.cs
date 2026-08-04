@@ -22,6 +22,10 @@ namespace Strazh.Analysis
     /// Durations come from the gaps between consecutive stage-transition events, so the "Loading"
     /// figure reflects real time in <c>AddToWorkspace</c> only because the pipeline raises a
     /// dedicated load-start event — otherwise queue wait and load time would be conflated.
+    ///
+    /// A project's wall clock is split into the time it spent being worked on and the time it spent
+    /// parked (see <see cref="NonWorkingStages"/>); rankings use the former, since the latter says more
+    /// about the pipeline's shape than about the project.
     /// </summary>
     public sealed class MetricsAnalysisProgress : IAnalysisProgress
     {
@@ -136,9 +140,31 @@ namespace Strazh.Analysis
             return spans;
         }
 
+        /// <summary>
+        /// Stages during which nothing is being done to a project — it is only parked, waiting for a
+        /// later stage to reach it. Both spans can run far longer than any real work:
+        /// <list type="bullet">
+        /// <item><description><c>Waiting</c> — the Load stage is sequential and cannot start until every
+        /// build has finished, so a project that built early waits for all the others.</description></item>
+        /// <item><description><c>deferred</c> — a project the build pipeline dropped is parked until the
+        /// fallback pass records it, which happens after the whole stream has drained.</description></item>
+        /// </list>
+        /// Counting either as time spent on the project would rank the pipeline's shape instead of the
+        /// projects, hiding the ones that are genuinely slow.
+        /// </summary>
+        private static readonly string[] NonWorkingStages = ["Waiting", "deferred"];
+
+        private static bool IsWorking(string stage) => !NonWorkingStages.Contains(stage);
+
+        private static double WorkingMillis(Dictionary<string, double> spans) =>
+            spans.Where(s => IsWorking(s.Key)).Sum(s => s.Value);
+
+        private static double WaitingMillis(Dictionary<string, double> spans) =>
+            spans.Where(s => !IsWorking(s.Key)).Sum(s => s.Value);
+
         private void WriteReport()
         {
-            List<(string Path, Timeline Timeline, Dictionary<string, double> Spans, double TotalMs)> rows;
+            List<Row> rows;
             lock (_lock)
             {
                 rows = _timelines
@@ -148,7 +174,8 @@ namespace Strazh.Analysis
                         var total = events.Count > 1
                             ? (events.Max(e => e.At) - events.Min(e => e.At)).TotalMilliseconds
                             : 0.0;
-                        return (kv.Key, kv.Value, StageMillis(kv.Value), total);
+                        var spans = StageMillis(kv.Value);
+                        return new Row(kv.Key, kv.Value, spans, total, WorkingMillis(spans), WaitingMillis(spans));
                     })
                     .ToList();
             }
@@ -156,7 +183,7 @@ namespace Strazh.Analysis
             Directory.CreateDirectory(Path.GetDirectoryName(_metricsPath)!);
             using (var writer = new StreamWriter(_metricsPath, append: false))
             {
-                foreach (var row in rows.OrderByDescending(r => r.TotalMs))
+                foreach (var row in rows.OrderByDescending(r => r.WorkingMs))
                 {
                     var record = new
                     {
@@ -165,6 +192,8 @@ namespace Strazh.Analysis
                         outcome = row.Timeline.Outcome,
                         triples = row.Timeline.Triples,
                         totalMs = Math.Round(row.TotalMs, 1),
+                        workingMs = Math.Round(row.WorkingMs, 1),
+                        waitingMs = Math.Round(row.WaitingMs, 1),
                         stagesMs = row.Spans.ToDictionary(s => s.Key, s => Math.Round(s.Value, 1)),
                     };
                     writer.WriteLine(JsonSerializer.Serialize(record));
@@ -174,8 +203,17 @@ namespace Strazh.Analysis
             PrintSummary(rows);
         }
 
-        private void PrintSummary(
-            List<(string Path, Timeline Timeline, Dictionary<string, double> Spans, double TotalMs)> rows)
+        // One project's timings: the wall clock from its first to its last event, split into the time
+        // it spent being worked on and the time it spent queued.
+        private readonly record struct Row(
+            string Path,
+            Timeline Timeline,
+            Dictionary<string, double> Spans,
+            double TotalMs,
+            double WorkingMs,
+            double WaitingMs);
+
+        private void PrintSummary(List<Row> rows)
         {
             var wall = (_runEnd - _runStart).TotalSeconds;
             Console.WriteLine();
@@ -196,14 +234,21 @@ namespace Strazh.Analysis
                 Console.WriteLine($"    {stage,-12} {ms / 1000.0,8:F1}s");
             }
 
-            Console.WriteLine("  Slowest projects (by total time):");
-            foreach (var row in rows.OrderByDescending(r => r.TotalMs).Take(10))
+            // Ranked by working time, not wall clock: a project can sit in the Load queue — or parked
+            // after being deferred — for longer than any of its real work took, and including that would
+            // rank the pipeline's shape rather than the projects. The parked time is still shown per
+            // project so it is not lost.
+            Console.WriteLine("  Slowest projects (by time spent working, excluding queued/deferred time):");
+            foreach (var row in rows.OrderByDescending(r => r.WorkingMs).Take(10))
             {
                 var breakdown = string.Join(", ", row.Spans
+                    .Where(s => IsWorking(s.Key))
                     .OrderByDescending(s => s.Value)
                     .Take(3)
                     .Select(s => $"{s.Key} {s.Value / 1000.0:F1}s"));
-                Console.WriteLine($"    {row.TotalMs / 1000.0,8:F1}s  {row.Timeline.Name}  [{breakdown}]");
+                Console.WriteLine(
+                    $"    {row.WorkingMs / 1000.0,8:F1}s  {row.Timeline.Name}  [{breakdown}]"
+                    + $" (+{row.WaitingMs / 1000.0:F1}s queued/deferred)");
             }
         }
     }

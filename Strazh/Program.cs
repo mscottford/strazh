@@ -71,6 +71,14 @@ namespace Strazh
             };
             rootCommand.Options.Add(optionBuildLogDir);
 
+            var optionBuildTimeout = new Option<int?>("--build-timeout")
+            {
+                Description = "optional number of minutes a single project build may run before that project is "
+                    + $"abandoned (default {AnalyzerConfig.DefaultBuildTimeout.TotalMinutes:F0}); raise it when large "
+                    + "projects are being reported as timed out"
+            };
+            rootCommand.Options.Add(optionBuildTimeout);
+
             var optionNeo4jUrl = new Option<string>("--neo4j-url", "-u")
             {
                 Description = "optional connection URL for the Neo4j database (default `neo4j://localhost:7687`)"
@@ -89,7 +97,8 @@ namespace Strazh
                     CacheDirectory: parseResult.GetValue(optionCache),
                     NoCache: parseResult.GetValue(optionNoCache),
                     BuildLogDirectory: parseResult.GetValue(optionBuildLogDir),
-                    Neo4jUrl: parseResult.GetValue(optionNeo4jUrl)
+                    Neo4jUrl: parseResult.GetValue(optionNeo4jUrl),
+                    BuildTimeoutMinutes: parseResult.GetValue(optionBuildTimeout)
                 ));
             });
 
