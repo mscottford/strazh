@@ -105,7 +105,8 @@ namespace Strazh.Analysis
                         },
                         config.CacheDirectory,
                         config.NoCache,
-                        config.BuildLogDirectory)))
+                        config.BuildLogDirectory,
+                        config.BuildTimeout)))
                 {
                     var capturedEntry = entry;
                     var projectPath = capturedEntry.Item2.ProjectFilePath;
@@ -376,7 +377,9 @@ namespace Strazh.Analysis
             StreamCallbacks Callbacks,
             string? CacheDirectory,
             bool NoCache,
-            string? BuildLogDirectory);
+            string? BuildLogDirectory,
+            // Zero (the value a defaulted AnalysisOptions carries) means "use the default timeout".
+            TimeSpan BuildTimeout = default);
 
         private readonly record struct CacheContext(
             string Directory,
@@ -389,7 +392,8 @@ namespace Strazh.Analysis
             StreamCallbacks Callbacks,
             BuildStageLabel BuildLabel,
             bool IsScanPass,
-            string? BuildLogDirectory);
+            string? BuildLogDirectory,
+            TimeSpan BuildTimeout);
 
         private readonly record struct ProjectIdentity(string Path, string Name, string FileName);
 
@@ -407,10 +411,17 @@ namespace Strazh.Analysis
                 Directory.CreateDirectory(options.BuildLogDirectory);
             }
 
+            // A defaulted AnalysisOptions carries TimeSpan.Zero, which would time every build out
+            // instantly; treat anything non-positive as "unset" and use the default.
+            var buildTimeout = options.BuildTimeout > TimeSpan.Zero
+                ? options.BuildTimeout
+                : AnalyzerConfig.DefaultBuildTimeout;
+
             HashSet<string>? projectsNeedingRebuild = null;
             if (options.CacheDirectory != null)
             {
                 Directory.CreateDirectory(options.CacheDirectory);
+                PrepareStagingDirectory(options.CacheDirectory);
                 projectsNeedingRebuild = options.NoCache
                     ? manager.Projects.Values
                         .Select(p => p.ProjectFile.Path)
@@ -429,7 +440,8 @@ namespace Strazh.Analysis
             {
                 await RunBuildStageAsync(new BuildStageContext(
                     manager, new CacheContext(options.CacheDirectory, projectsNeedingRebuild!),
-                    options.Callbacks, BuildLabel: BuildStageLabel.Building, IsScanPass: true, options.BuildLogDirectory));
+                    options.Callbacks, BuildLabel: BuildStageLabel.Building, IsScanPass: true,
+                    options.BuildLogDirectory, buildTimeout));
                 // Re-derive the rebuild set without the noCache override — the Building pass
                 // just built everything fresh, so nothing should be considered stale.
                 projectsNeedingRebuild = ComputeProjectsNeedingRebuild(manager.Projects.Values, options.CacheDirectory);
@@ -446,7 +458,8 @@ namespace Strazh.Analysis
                 ? new CacheContext(options.CacheDirectory, projectsNeedingRebuild!)
                 : null;
             IReadOnlyList<IAnalyzerResult>?[] results = await RunBuildStageAsync(new BuildStageContext(
-                manager, mainCache, options.Callbacks, BuildLabel: BuildStageLabel.PostBuild, IsScanPass: false, options.BuildLogDirectory));
+                manager, mainCache, options.Callbacks, BuildLabel: BuildStageLabel.PostBuild, IsScanPass: false,
+                options.BuildLogDirectory, buildTimeout));
 
             // Load stage: add each completed result to the workspace and yield immediately,
             // so analysis can begin on each project without waiting for all to be loaded.
@@ -689,8 +702,17 @@ namespace Strazh.Analysis
             return null; // Stale or corrupted binlog — caller falls through to a fresh build.
         }
 
-        // Runs up to MaxBuildAttempts fresh MSBuild invocations, deleting a bad binlog between
-        // retries. Returns results on the first successful attempt, or null after all attempts fail.
+        // Runs up to MaxBuildAttempts fresh MSBuild invocations, returning results on the first
+        // successful attempt or null after all attempts fail.
+        //
+        // Each attempt writes its binlog to a staging path and publishes it into the cache only once
+        // the build has succeeded AND the log has been read back successfully. Nothing else may write
+        // to the cache path, because a build that is abandoned — a timeout, above all — leaves a
+        // half-written log behind: MSBuild keeps writing after we stop waiting for it and is only
+        // reaped when this process exits, so whatever is on disk is truncated. Written straight to the
+        // cache path, that truncated log is picked up as a cache hit by the next run, fails to replay,
+        // and costs a rebuild that times out and truncates it again — the project never caches. Staging
+        // also removes the risk of two projects whose cache paths collide writing the same file at once.
         private static async Task<IReadOnlyList<IAnalyzerResult>?> RunFreshBuildLoopAsync(
             ProjectBuildState state, BuildStageContext stage)
         {
@@ -698,9 +720,16 @@ namespace Strazh.Analysis
             for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
             {
                 stage.Callbacks.OnBuildStarted?.Invoke(state.Identity.Path, state.Identity.Name, false, stage.BuildLabel);
-                var outcome = await BuildWithTimeoutAsync(state.Project, CreateBuildOptions(stage.BuildLogDirectory, state.Identity.Path, binlogPath: state.BinlogPath));
+                var stagingPath = GetStagingBinlogPath(state.BinlogPath, attempt);
+                var outcome = await BuildWithTimeoutAsync(
+                    state.Project,
+                    CreateBuildOptions(stage.BuildLogDirectory, state.Identity.Path, binlogPath: stagingPath),
+                    stage.BuildTimeout);
                 if (outcome.TimedOut)
                 {
+                    // The abandoned MSBuild may still hold the staging file open; deleting it now is
+                    // best-effort, and anything left behind is swept at the start of a later run.
+                    TryDeleteFile(stagingPath);
                     SignalBuildNotCompleted(state.Identity, reason: "build timed out", stage);
                     return null;
                 }
@@ -714,10 +743,14 @@ namespace Strazh.Analysis
                 // successful build. The binlog is written natively by MSBuild and read
                 // by StructuredLogger, which handles the current format regardless of
                 // version skew.
-                var binlogExists = File.Exists(state.BinlogPath);
-                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(stage.Manager, state.BinlogPath, stage, state.Identity) : [];
+                var binlogExists = File.Exists(stagingPath);
+                var tfmResults = binlogExists ? await TryAnalyzeBinlogAsync(stage.Manager, stagingPath, stage, state.Identity) : [];
                 if (tfmResults.Any(r => r.Succeeded))
                 {
+                    // The log built and read cleanly, so it is safe to cache. Move rather than copy:
+                    // staging sits in a subdirectory of the cache, so this is an atomic rename and a
+                    // reader can never see a half-published file.
+                    PublishBinlogToCache(stagingPath, state.BinlogPath);
                     // Write an initial deps sidecar with whatever project references
                     // MSBuild returned. Binlog replay often leaves this empty (MSBuild
                     // 17.14+ does not emit ProjectReferences into the replay). The Load
@@ -727,14 +760,12 @@ namespace Strazh.Analysis
                     stage.Callbacks.OnBuildCompleted?.Invoke(state.Identity.Path);
                     return tfmResults;
                 }
-                else if (attempt < MaxBuildAttempts)
-                {
-                    if (binlogExists)
-                    {
-                        File.Delete(state.BinlogPath);
-                    }
-                }
-                else
+
+                // Unusable log: discard it — the next attempt stages its own — and never let it reach
+                // the cache, so a failing project stays a slow rebuild rather than becoming a cache hit
+                // that cannot be replayed.
+                TryDeleteFile(stagingPath);
+                if (attempt == MaxBuildAttempts)
                 {
                     var reason = binlogExists
                         ? "build log could not be read"
@@ -754,7 +785,8 @@ namespace Strazh.Analysis
             for (var attempt = 1; attempt <= MaxBuildAttempts; attempt++)
             {
                 stage.Callbacks.OnBuildStarted?.Invoke(identity.Path, identity.Name, false, stage.BuildLabel);
-                var outcome = await BuildWithTimeoutAsync(project, CreateBuildOptions(stage.BuildLogDirectory, identity.Path));
+                var outcome = await BuildWithTimeoutAsync(
+                    project, CreateBuildOptions(stage.BuildLogDirectory, identity.Path), stage.BuildTimeout);
                 if (outcome.TimedOut)
                 {
                     SignalBuildNotCompleted(identity, reason: "build timed out", stage);
@@ -797,11 +829,6 @@ namespace Strazh.Analysis
             return firstLine.Length > 120 ? firstLine[..120] + "…" : firstLine;
         }
 
-        // If a build hangs (e.g. Android/MAUI projects waiting on SDK tools not present in the
-        // environment), WhenAny returns after the timeout and we skip the project. The underlying
-        // Task.Run continues to hold its thread until the process eventually exits or is reaped
-        // when the parent process terminates — that is acceptable.
-        private static readonly TimeSpan BuildTimeout = TimeSpan.FromMinutes(5);
         private const int MaxBuildAttempts = 3;
         // A just-built binlog may not be fully flushed when project.Build() returns; re-read it a few
         // times with a short delay before giving up and rebuilding (see TryAnalyzeBinlogAsync).
@@ -867,7 +894,13 @@ namespace Strazh.Analysis
 
         private readonly record struct BuildOutcome(IReadOnlyList<IAnalyzerResult>? Results, bool TimedOut, string? BuildError = null);
 
-        private static async Task<BuildOutcome> BuildWithTimeoutAsync(IProjectAnalyzer project, EnvironmentOptions opts)
+        // If a build hangs (e.g. Android/MAUI projects waiting on SDK tools not present in the
+        // environment), WhenAny returns after the timeout and we skip the project. The underlying
+        // Task.Run continues to hold its thread until the process eventually exits or is reaped
+        // when the parent process terminates — that is acceptable, but it is also why the caller
+        // must treat the binlog of a timed-out build as unusable (see RunFreshBuildLoopAsync).
+        private static async Task<BuildOutcome> BuildWithTimeoutAsync(
+            IProjectAnalyzer project, EnvironmentOptions opts, TimeSpan buildTimeout)
         {
             string? buildError = null;
             var buildTask = Task.Run<IReadOnlyList<IAnalyzerResult>?>(() =>
@@ -888,7 +921,7 @@ namespace Strazh.Analysis
                     return null;
                 }
             });
-            if (await Task.WhenAny(buildTask, Task.Delay(BuildTimeout)).ConfigureAwait(false) != buildTask)
+            if (await Task.WhenAny(buildTask, Task.Delay(buildTimeout)).ConfigureAwait(false) != buildTask)
             {
                 return new BuildOutcome(Results: null, TimedOut: true);
             }
@@ -956,6 +989,67 @@ namespace Strazh.Analysis
             var bytes = MD5.HashData(Encoding.UTF8.GetBytes(project.ProjectFile.Path));
             var hash = Convert.ToHexString(bytes)[..HashPrefixLength];
             return Path.Combine(cacheDirectory, $"{project.ProjectFile.Name}_{hash}.binlog");
+        }
+
+        // Binlogs are built here and moved into the cache only once they are known-good. The directory
+        // sits inside the cache so publishing is a same-filesystem rename, and its name is prefixed with
+        // a dot so it is not mistaken for a cache entry.
+        private const string StagingDirectoryName = ".partial";
+
+        // Leftovers older than this are another run's abandoned builds, safe to sweep. A generous
+        // window keeps the sweep away from a long build running concurrently in another process.
+        internal static readonly TimeSpan StagingLeftoverMaxAge = TimeSpan.FromHours(24);
+
+        internal static string GetStagingDirectory(string cacheDirectory) =>
+            Path.Combine(cacheDirectory, StagingDirectoryName);
+
+        // A path unique to this process and attempt, so concurrent runs — and the retries within one
+        // run — never write to the same staging file. The name keeps the .binlog extension because
+        // MSBuild's binary logger rejects any other (MSB1029); what keeps a staged log from being taken
+        // for a cache entry is the directory it sits in, not its name.
+        internal static string GetStagingBinlogPath(string binlogCachePath, int attempt)
+        {
+            var cacheDirectory = Path.GetDirectoryName(binlogCachePath)!;
+            var name = Path.GetFileNameWithoutExtension(binlogCachePath);
+            return Path.Combine(GetStagingDirectory(cacheDirectory),
+                $"{name}.{Environment.ProcessId}-{attempt}.binlog");
+        }
+
+        // Creates the staging directory and clears out any long-abandoned leftovers. A build that is
+        // killed while MSBuild still holds its staging file open (Windows refuses to delete it) would
+        // otherwise leave it behind for good.
+        internal static void PrepareStagingDirectory(string cacheDirectory)
+        {
+            var stagingDirectory = GetStagingDirectory(cacheDirectory);
+            Directory.CreateDirectory(stagingDirectory);
+            var cutoff = DateTime.UtcNow - StagingLeftoverMaxAge;
+            foreach (var leftover in Directory.EnumerateFiles(stagingDirectory, "*.binlog"))
+            {
+                if (File.GetLastWriteTimeUtc(leftover) < cutoff)
+                {
+                    TryDeleteFile(leftover);
+                }
+            }
+        }
+
+        // Publishes a known-good staged binlog into the cache, replacing any earlier entry.
+        internal static void PublishBinlogToCache(string stagingPath, string binlogCachePath) =>
+            File.Move(stagingPath, binlogCachePath, overwrite: true);
+
+        // Deletes a file we no longer want, tolerating the cases where it is already gone or still
+        // held open by a build we have stopped waiting for.
+        internal static void TryDeleteFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
 
         // Returns true if no binlog exists, or if the binlog is older than any source or

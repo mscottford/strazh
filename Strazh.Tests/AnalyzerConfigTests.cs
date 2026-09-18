@@ -155,4 +155,33 @@ public class AnalyzerConfigTests
         Assert.Equal("", config.Solution);
         Assert.Empty(config.Projects);
     }
+
+    [Fact]
+    public void BuildTimeout_DefaultsToTwentyMinutes()
+    {
+        var config = new AnalyzerConfig(BaseOptions());
+
+        Assert.Equal(TimeSpan.FromMinutes(20), config.BuildTimeout);
+        Assert.Equal(AnalyzerConfig.DefaultBuildTimeout, config.BuildTimeout);
+    }
+
+    [Fact]
+    public void BuildTimeout_UsesTheNumberOfMinutesGiven()
+    {
+        var config = new AnalyzerConfig(BaseOptions() with { BuildTimeoutMinutes = 45 });
+
+        Assert.Equal(TimeSpan.FromMinutes(45), config.BuildTimeout);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void BuildTimeout_NonPositiveValuesFallBackToTheDefault(int minutes)
+    {
+        // Taken literally these would abandon every build the moment it started, which is never what
+        // someone passing them meant.
+        var config = new AnalyzerConfig(BaseOptions() with { BuildTimeoutMinutes = minutes });
+
+        Assert.Equal(AnalyzerConfig.DefaultBuildTimeout, config.BuildTimeout);
+    }
 }
